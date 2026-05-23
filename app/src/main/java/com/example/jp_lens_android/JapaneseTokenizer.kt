@@ -25,7 +25,7 @@ object JapaneseTokenizer {
 
     private val tokenizer: Tokenizer by lazy { Tokenizer() }
 
-    private val dropPos = setOf("助詞", "助動詞", "記号", "フィラー", "その他")
+    private val dropPos = setOf("その他")
 
     fun warmUp() {
         // Force dictionary load off the hot path.
