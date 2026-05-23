@@ -1,0 +1,113 @@
+package com.example.jp_lens_android
+
+import com.atilika.kuromoji.ipadic.Token
+import com.atilika.kuromoji.ipadic.Tokenizer
+
+/**
+ * Thin wrapper around Kuromoji IPADIC.
+ *
+ * Filter is a small blacklist of grammatical-glue POS — particles (の, を, が, に, は…),
+ * auxiliary verbs (だ, です, ます, た, ない…), punctuation, fillers, and unclassified.
+ * Everything else (nouns including pronouns and numerals, verbs, adjectives, adverbs,
+ * conjunctions, interjections, prefixes, pre-noun adjectivals) is kept and returned
+ * with its dictionary form.
+ */
+object JapaneseTokenizer {
+
+    data class Morpheme(
+        val surface: String,    // as it appeared in the text
+        val base: String,       // dictionary form
+        val pos: String,        // top-level part of speech (e.g. 名詞)
+        val reading: String,    // katakana reading, or "" if unknown
+        val start: Int,         // char offset in the input string
+        val end: Int            // exclusive char offset
+    )
+
+    private val tokenizer: Tokenizer by lazy { Tokenizer() }
+
+    private val dropPos = setOf("助詞", "助動詞", "記号", "フィラー", "その他")
+
+    fun warmUp() {
+        // Force dictionary load off the hot path.
+        tokenizer.tokenize("起動")
+    }
+
+    fun extract(text: String): List<Morpheme> {
+        if (text.isBlank()) return emptyList()
+        return tokenizer.tokenize(text)
+            .filter { keep(it) }
+            .map { it.toMorpheme() }
+    }
+
+    private fun keep(t: Token): Boolean {
+        if (t.partOfSpeechLevel1 in dropPos) return false
+        // Skip lone ASCII (spaces, punctuation that slip through, single Latin letters).
+        if (t.surface.length == 1 && t.surface[0].code < 0x80) return false
+        // Drop tokens that contain no Japanese characters at all (pure digits / latin / etc.).
+        if (!containsJapanese(t.surface)) return false
+        return true
+    }
+
+    /** True if [s] contains at least one hiragana, katakana, or kanji character. */
+    private fun containsJapanese(s: String): Boolean {
+        for (c in s) {
+            val code = c.code
+            if (code in 0x3040..0x309F) return true   // Hiragana
+            if (code in 0x30A0..0x30FF) return true   // Katakana
+            if (code in 0x4E00..0x9FFF) return true   // CJK Unified Ideographs (kanji)
+            if (code in 0x3400..0x4DBF) return true   // CJK Extension A
+            if (code in 0xFF66..0xFF9F) return true   // Half-width katakana
+        }
+        return false
+    }
+
+    /** Returns true if the string contains at least one CJK ideograph (kanji). */
+    fun containsKanji(s: String): Boolean {
+        for (c in s) {
+            val code = c.code
+            if (code in 0x4E00..0x9FFF) return true   // CJK Unified Ideographs
+            if (code in 0x3400..0x4DBF) return true   // CJK Extension A
+        }
+        return false
+    }
+
+    /**
+     * Re-tokenizes [text] without filtering and concatenates each token's reading
+     * (converted to hiragana). Used for the range popup, where we want a full
+     * furigana-like rendering including particles and auxiliaries.
+     */
+    fun fullReadingHiragana(text: String): String {
+        if (text.isBlank()) return ""
+        val sb = StringBuilder()
+        for (t in tokenizer.tokenize(text)) {
+            val r = t.reading
+            if (r.isNullOrEmpty() || r == "*") sb.append(t.surface)
+            else sb.append(katakanaToHiragana(r))
+        }
+        return sb.toString()
+    }
+
+    /** Converts katakana characters to hiragana, leaves other chars untouched. */
+    fun katakanaToHiragana(katakana: String): String {
+        val sb = StringBuilder(katakana.length)
+        for (c in katakana) {
+            val code = c.code
+            if (code in 0x30A1..0x30F6) sb.append((code - 0x60).toChar())
+            else sb.append(c)
+        }
+        return sb.toString()
+    }
+
+    private fun Token.toMorpheme(): Morpheme {
+        val base = if (baseForm.isNullOrEmpty() || baseForm == "*") surface else baseForm
+        val rd = if (reading.isNullOrEmpty() || reading == "*") "" else reading
+        return Morpheme(
+            surface = surface,
+            base = base,
+            pos = partOfSpeechLevel1,
+            reading = rd,
+            start = position,
+            end = position + surface.length
+        )
+    }
+}

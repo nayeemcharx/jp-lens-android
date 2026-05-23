@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Letter J -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M22,30 L50,30 L50,40 L42,40 L42,70 Q42,76 36,76 Q30,76 30,70 L36,70 L36,40 L22,40 Z" />
+
+    <!-- Letter P (with inner hole via evenOdd fill rule) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M58,30 L72,30 C80,30 86,36 86,44 C86,52 80,58 72,58 L66,58 L66,78 L58,78 Z M66,38 L66,50 L72,50 C75,50 77,48 77,44 C77,40 75,38 72,38 Z" />
+</vector>
