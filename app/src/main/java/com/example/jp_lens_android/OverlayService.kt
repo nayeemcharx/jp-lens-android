@@ -11,7 +11,11 @@ import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.text.Spannable
+import android.text.SpannableStringBuilder
+import android.text.style.StyleSpan
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
@@ -48,6 +52,13 @@ class OverlayService : Service() {
         const val ACTION_STOP = "com.example.jp_lens_android.STOP"
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
+        const val EXTRA_MODE = "mode"
+
+        const val MODE_MORPHEME = 0
+        const val MODE_SENTENCE_LLM = 1
+
+        const val PREFS_NAME = "jp_lens"
+        const val PREF_BEDROCK_TOKEN = "aws_bearer_token_bedrock"
 
         private const val CHANNEL_ID = "jp_lens_overlay"
         private const val NOTIFICATION_ID = 1001
@@ -83,6 +94,20 @@ class OverlayService : Service() {
 
     private data class RenderedBox(val view: View, val box: MorphemeBox)
     private val renderedBoxes = mutableListOf<RenderedBox>()
+
+    // Sentence-mode overlays (MODE_SENTENCE_LLM).
+    private data class SentenceBox(
+        val left: Int,
+        val top: Int,
+        val width: Int,
+        val height: Int,
+        val sentenceId: Int,    // shared across all box pieces of the same sentence
+        val fullText: String,   // full sentence text (may span multiple line-pieces)
+    )
+    private data class RenderedSentenceBox(val view: View, val box: SentenceBox)
+    private val renderedSentenceBoxes = mutableListOf<RenderedSentenceBox>()
+
+    private var mode: Int = MODE_MORPHEME
 
     // Range-selection state: two long-press anchors. Both null = IDLE,
     // anchor1 only = ANCHORED, both set = RANGE.
@@ -121,6 +146,9 @@ class OverlayService : Service() {
 
     private fun handleStart(intent: Intent) {
         startForegroundCompat()
+
+        mode = intent.getIntExtra(EXTRA_MODE, MODE_MORPHEME)
+        Log.i(TAG, "Starting mode=$mode (0=morpheme, 1=sentence+LLM)")
 
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
         val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -221,8 +249,12 @@ class OverlayService : Service() {
 
     private fun updateOcrButtonAppearance() {
         val btn = floatingView as? Button ?: return
-        val active = renderedBoxes.isNotEmpty()
-        btn.text = if (active) "✕" else "OCR"
+        val active = renderedBoxes.isNotEmpty() || renderedSentenceBoxes.isNotEmpty()
+        btn.text = when {
+            active -> "✕"
+            mode == MODE_SENTENCE_LLM -> "LLM"
+            else -> "OCR"
+        }
         btn.background = GradientDrawable().apply {
             if (active) {
                 shape = GradientDrawable.RECTANGLE
@@ -230,7 +262,10 @@ class OverlayService : Service() {
                 setColor(Color.argb(230, 220, 80, 60))
             } else {
                 shape = GradientDrawable.OVAL
-                setColor(Color.argb(220, 30, 100, 220))
+                setColor(
+                    if (mode == MODE_SENTENCE_LLM) Color.argb(220, 140, 60, 200)
+                    else Color.argb(220, 30, 100, 220)
+                )
             }
         }
     }
@@ -270,9 +305,10 @@ class OverlayService : Service() {
     }
 
     private fun captureAndRecognize() {
-        // Toggle: if boxes are showing, just clear them.
-        if (renderedBoxes.isNotEmpty()) {
+        // Toggle: if any overlay is showing, just clear it.
+        if (renderedBoxes.isNotEmpty() || renderedSentenceBoxes.isNotEmpty()) {
             clearMorphemeBoxes()
+            clearSentenceBoxes()
             return
         }
         if (isProcessing) return
@@ -334,13 +370,24 @@ class OverlayService : Service() {
                     Log.i(TAG, "[block] ${block.text.replace("\n", " / ")}")
                 }
                 Log.i(TAG, "[full]\n${result.text}")
-                // Tokenize off the main thread — first call loads ~7MB dictionary.
-                captureHandler?.post {
-                    val boxes = computeMorphemeBoxes(result)
-                    logMorphemes(boxes)
-                    mainHandler.post {
-                        renderMorphemeBoxes(boxes)
-                        isProcessing = false
+                if (mode == MODE_SENTENCE_LLM) {
+                    captureHandler?.post {
+                        val sboxes = computeSentenceBoxes(result)
+                        Log.i(TAG, "Sentence boxes: ${sboxes.size}")
+                        mainHandler.post {
+                            renderSentenceBoxes(sboxes)
+                            isProcessing = false
+                        }
+                    }
+                } else {
+                    // Tokenize off the main thread — first call loads ~7MB dictionary.
+                    captureHandler?.post {
+                        val boxes = computeMorphemeBoxes(result)
+                        logMorphemes(boxes)
+                        mainHandler.post {
+                            renderMorphemeBoxes(boxes)
+                            isProcessing = false
+                        }
                     }
                 }
             }
@@ -952,15 +999,507 @@ class OverlayService : Service() {
         }.start()
     }
 
+    // ───────────────────────── Sentence mode (LLM) ─────────────────────────
+
+    /**
+     * Converts inline `**bold**` markdown to actual bold spans. The LLM sometimes
+     * emits emphasis markup which would otherwise show up as literal asterisks
+     * in the popup. Anything that isn't a `**…**` pair is passed through verbatim.
+     */
+    private fun renderInlineMarkdown(s: String): CharSequence {
+        if (s.isEmpty() || !s.contains("**")) return s
+        val out = SpannableStringBuilder()
+        val re = Regex("""\*\*(.+?)\*\*""", RegexOption.DOT_MATCHES_ALL)
+        var i = 0
+        for (m in re.findAll(s)) {
+            if (m.range.first > i) out.append(s, i, m.range.first)
+            val start = out.length
+            out.append(m.groupValues[1])
+            out.setSpan(StyleSpan(Typeface.BOLD), start, out.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+            i = m.range.last + 1
+        }
+        if (i < s.length) out.append(s, i, s.length)
+        return out
+    }
+
+    private data class ElementRange(val box: android.graphics.Rect, val start: Int, val end: Int)
+
+    private fun buildLineRanges(line: Text.Line, vertical: Boolean): Pair<String, List<ElementRange>> {
+        val elements = line.elements
+        if (elements.isEmpty()) return "" to emptyList()
+        val sorted = if (vertical) elements.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE } else elements
+        val sb = StringBuilder()
+        val ranges = ArrayList<ElementRange>(sorted.size)
+        for (e in sorted) {
+            val eBox = e.boundingBox ?: continue
+            val s = sb.length
+            sb.append(e.text)
+            ranges += ElementRange(eBox, s, sb.length)
+        }
+        return sb.toString() to ranges
+    }
+
+    /** Bounding box for chars [from, to) on a line, given element ranges. */
+    private fun rectForRange(
+        ranges: List<ElementRange>,
+        from: Int,
+        to: Int,
+        vertical: Boolean,
+        lineBox: android.graphics.Rect?,
+        lineTextLen: Int,
+    ): android.graphics.Rect? {
+        if (to <= from) return null
+        var left = Int.MAX_VALUE
+        var top = Int.MAX_VALUE
+        var right = Int.MIN_VALUE
+        var bottom = Int.MIN_VALUE
+        for (r in ranges) {
+            val overlapStart = max(r.start, from)
+            val overlapEnd = min(r.end, to)
+            if (overlapEnd <= overlapStart) continue
+            val eLen = (r.end - r.start).coerceAtLeast(1)
+            if (vertical) {
+                val charH = r.box.height().toFloat() / eLen
+                val t = r.box.top + ((overlapStart - r.start) * charH).toInt()
+                val b = r.box.top + ((overlapEnd - r.start) * charH).toInt()
+                if (r.box.left < left) left = r.box.left
+                if (r.box.right > right) right = r.box.right
+                if (t < top) top = t
+                if (b > bottom) bottom = b
+            } else {
+                val charW = r.box.width().toFloat() / eLen
+                val l = r.box.left + ((overlapStart - r.start) * charW).toInt()
+                val rEdge = r.box.left + ((overlapEnd - r.start) * charW).toInt()
+                if (l < left) left = l
+                if (rEdge > right) right = rEdge
+                if (r.box.top < top) top = r.box.top
+                if (r.box.bottom > bottom) bottom = r.box.bottom
+            }
+        }
+        if (left == Int.MAX_VALUE) {
+            // Fallback to line box interpolation.
+            val lb = lineBox ?: return null
+            return if (vertical) {
+                val charH = lb.height().toFloat() / max(lineTextLen, 1)
+                android.graphics.Rect(
+                    lb.left,
+                    lb.top + (from * charH).toInt(),
+                    lb.right,
+                    lb.top + (to * charH).toInt()
+                )
+            } else {
+                val charW = lb.width().toFloat() / max(lineTextLen, 1)
+                android.graphics.Rect(
+                    lb.left + (from * charW).toInt(),
+                    lb.top,
+                    lb.left + (to * charW).toInt(),
+                    lb.bottom
+                )
+            }
+        }
+        return android.graphics.Rect(left, top, right, bottom)
+    }
+
+    /**
+     * Splits OCR output into sentence-level boxes. Lines are walked in reading
+     * order within each block; pieces between Japanese terminators (。！？!?) get
+     * grouped into one logical sentence even when split across lines. Each
+     * physical line-piece becomes its own clickable rectangle; all pieces of the
+     * same sentence carry the same fullText (and same sentenceId) so any click
+     * triggers the LLM with the complete sentence.
+     */
+    private fun computeSentenceBoxes(visionText: Text): List<SentenceBox> {
+        val terminators = setOf('。', '！', '？', '!', '?', '．', '.')
+        val out = mutableListOf<SentenceBox>()
+        var sid = 0
+
+        for (block in visionText.textBlocks) {
+            val vert = isBlockVertical(block)
+            val orderedLines = if (vert) {
+                block.lines.sortedByDescending { it.boundingBox?.centerX() ?: 0 }
+            } else block.lines
+
+            data class Piece(val rect: android.graphics.Rect, val text: String)
+            var pendingPieces = mutableListOf<Piece>()
+            val pendingText = StringBuilder()
+
+            fun flushSentence() {
+                if (pendingPieces.isEmpty()) return
+                val full = pendingText.toString().trim()
+                if (full.isNotEmpty()) {
+                    for (p in pendingPieces) {
+                        out += SentenceBox(
+                            left = p.rect.left,
+                            top = p.rect.top,
+                            width = max(p.rect.width(), 1),
+                            height = max(p.rect.height(), 1),
+                            sentenceId = sid,
+                            fullText = full,
+                        )
+                    }
+                    sid++
+                }
+                pendingPieces = mutableListOf()
+                pendingText.setLength(0)
+            }
+
+            for (line in orderedLines) {
+                val lineVert = isLineVertical(line)
+                val (lineText, ranges) = buildLineRanges(line, lineVert)
+                if (lineText.isEmpty()) continue
+                val lineBox = line.boundingBox
+
+                var segStart = 0
+                var i = 0
+                while (i < lineText.length) {
+                    if (lineText[i] in terminators) {
+                        val segEnd = i + 1
+                        val rect = rectForRange(ranges, segStart, segEnd, lineVert, lineBox, lineText.length)
+                        if (rect != null) {
+                            pendingPieces += Piece(rect, lineText.substring(segStart, segEnd))
+                            pendingText.append(lineText, segStart, segEnd)
+                        }
+                        flushSentence()
+                        segStart = segEnd
+                    }
+                    i++
+                }
+                if (segStart < lineText.length) {
+                    val rect = rectForRange(ranges, segStart, lineText.length, lineVert, lineBox, lineText.length)
+                    if (rect != null) {
+                        pendingPieces += Piece(rect, lineText.substring(segStart, lineText.length))
+                        pendingText.append(lineText, segStart, lineText.length)
+                    }
+                }
+            }
+            // End of block — flush any sentence that lacked a terminator.
+            flushSentence()
+        }
+        return out
+    }
+
+    private fun renderSentenceBoxes(boxes: List<SentenceBox>) {
+        clearSentenceBoxes()
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else
+            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+        for (b in boxes) {
+            val view = View(this).apply {
+                background = makeSentenceBoxDrawable()
+                isClickable = true
+                setOnClickListener { onSentenceClick(b) }
+            }
+            val params = WindowManager.LayoutParams(
+                b.width, b.height,
+                type,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                x = b.left
+                y = b.top
+            }
+            try {
+                windowManager.addView(view, params)
+                renderedSentenceBoxes += RenderedSentenceBox(view, b)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to add sentence box view", e)
+            }
+        }
+        Log.i(TAG, "Rendered ${renderedSentenceBoxes.size} sentence boxes")
+        updateOcrButtonAppearance()
+    }
+
+    private fun makeSentenceBoxDrawable(): GradientDrawable = GradientDrawable().apply {
+        setStroke(dp(2), Color.argb(255, 140, 120, 240))
+        setColor(Color.argb(48, 140, 120, 240))
+        cornerRadius = dp(3).toFloat()
+    }
+
+    private fun clearSentenceBoxes() {
+        if (renderedSentenceBoxes.isEmpty() && popup == null) {
+            // popup may belong to morpheme mode; only dismiss if we own boxes
+        }
+        dismissPopup()
+        for (rb in renderedSentenceBoxes) {
+            runCatching { windowManager.removeView(rb.view) }
+        }
+        renderedSentenceBoxes.clear()
+        updateOcrButtonAppearance()
+    }
+
+    private fun onSentenceClick(box: SentenceBox) {
+        Log.i(TAG, "sentence tap → ${box.fullText}")
+        showLlmAnalysisPopup(box)
+    }
+
+    private fun showLlmAnalysisPopup(box: SentenceBox) {
+        dismissPopup()
+
+        val screenW = resources.displayMetrics.widthPixels
+        val screenH = resources.displayMetrics.heightPixels
+        val sideMargin = dp(8)
+        val maxPopupW = screenW - sideMargin * 2
+        val maxPopupH = (screenH * 0.65f).toInt()
+        // Cap for text wrapping: popup max width minus container padding minus
+        // close-button column. Text wraps before exceeding this.
+        val textMaxW = maxPopupW - dp(12) - dp(8) - dp(44)
+        // Reserve max scroll height = popup cap minus header row height budget.
+        val maxScrollH = maxPopupH - dp(60)
+
+        val titleView = TextView(this).apply {
+            text = box.fullText
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            maxWidth = textMaxW
+        }
+        val closeBtn = TextView(this).apply {
+            text = "✕"
+            setTextColor(Color.WHITE)
+            textSize = 20f
+            setPadding(dp(10), dp(2), dp(10), dp(2))
+            isClickable = true
+            setOnClickListener { dismissPopup() }
+        }
+        val headerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(titleView, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                1f
+            ))
+            addView(closeBtn, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+            setPadding(0, 0, 0, dp(6))
+        }
+
+        val wordHeader = TextView(this).apply {
+            text = "Word-by-word"
+            setTextColor(Color.argb(255, 180, 220, 255))
+            textSize = 12f
+            setPadding(0, dp(4), 0, dp(2))
+        }
+        val wordBody = TextView(this).apply {
+            text = "Analyzing…"
+            setTextColor(Color.argb(255, 230, 230, 230))
+            textSize = 13f
+            maxWidth = textMaxW
+        }
+        val phraseHeader = TextView(this).apply {
+            text = "Phrases"
+            setTextColor(Color.argb(255, 180, 220, 255))
+            textSize = 12f
+            setPadding(0, dp(6), 0, dp(2))
+            visibility = View.GONE
+        }
+        val phraseBody = TextView(this).apply {
+            setTextColor(Color.argb(255, 230, 230, 230))
+            textSize = 13f
+            maxWidth = textMaxW
+            visibility = View.GONE
+        }
+        val transHeader = TextView(this).apply {
+            text = "Translation"
+            setTextColor(Color.argb(255, 180, 220, 255))
+            textSize = 12f
+            setPadding(0, dp(6), 0, dp(2))
+            visibility = View.GONE
+        }
+        val transBody = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            maxWidth = textMaxW
+            visibility = View.GONE
+        }
+        val notesHeader = TextView(this).apply {
+            text = "Notes"
+            setTextColor(Color.argb(255, 180, 220, 255))
+            textSize = 12f
+            setPadding(0, dp(6), 0, dp(2))
+            visibility = View.GONE
+        }
+        val notesBody = TextView(this).apply {
+            setTextColor(Color.argb(255, 230, 230, 230))
+            textSize = 13f
+            maxWidth = textMaxW
+            visibility = View.GONE
+        }
+
+        val sectionsCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(wordHeader)
+            addView(wordBody)
+            addView(phraseHeader)
+            addView(phraseBody)
+            addView(transHeader)
+            addView(transBody)
+            addView(notesHeader)
+            addView(notesBody)
+        }
+        // ScrollView that caps its own height. Below the cap it wraps to content
+        // (so the popup stays small for short answers); past the cap it scrolls.
+        val scroll = object : android.widget.ScrollView(this) {
+            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                val capped = View.MeasureSpec.makeMeasureSpec(maxScrollH, View.MeasureSpec.AT_MOST)
+                super.onMeasure(widthMeasureSpec, capped)
+            }
+        }.apply {
+            isVerticalScrollBarEnabled = true
+            addView(sectionsCol, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                setColor(Color.argb(238, 0, 0, 0))
+                cornerRadius = dp(8).toFloat()
+            }
+            setPadding(dp(12), dp(8), dp(8), dp(8))
+            // MATCH_PARENT here so the header row stretches to the popup's
+            // natural width (determined by the scroll content), letting the
+            // title's weight=1 push the ✕ to the right edge.
+            addView(headerRow, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+            addView(scroll, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+        }
+
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else
+            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+        // Re-clamp the popup's on-screen position whenever its content changes
+        // size (e.g. when the LLM response arrives and sections become visible).
+        fun reposition() {
+            val wSpec = View.MeasureSpec.makeMeasureSpec(maxPopupW, View.MeasureSpec.AT_MOST)
+            val hSpec = View.MeasureSpec.makeMeasureSpec(maxPopupH, View.MeasureSpec.AT_MOST)
+            container.measure(wSpec, hSpec)
+            val pw = min(container.measuredWidth, maxPopupW)
+            val ph = min(container.measuredHeight, maxPopupH)
+
+            val centerX = box.left + box.width / 2
+            var x = centerX - pw / 2
+            if (x < sideMargin) x = sideMargin
+            if (x + pw > screenW - sideMargin) x = screenW - sideMargin - pw
+            var y = box.top - ph - dp(6)
+            if (y < sideMargin) y = box.top + box.height + dp(6)
+            if (y + ph > screenH - sideMargin) y = screenH - sideMargin - ph
+            if (y < sideMargin) y = sideMargin
+
+            val lp = container.layoutParams as? WindowManager.LayoutParams ?: return
+            if (lp.x != x || lp.y != y) {
+                lp.x = x
+                lp.y = y
+                runCatching { windowManager.updateViewLayout(container, lp) }
+            }
+        }
+
+        // Initial measure for first placement; popup itself remains WRAP_CONTENT.
+        val wSpec = View.MeasureSpec.makeMeasureSpec(maxPopupW, View.MeasureSpec.AT_MOST)
+        val hSpec = View.MeasureSpec.makeMeasureSpec(maxPopupH, View.MeasureSpec.AT_MOST)
+        container.measure(wSpec, hSpec)
+        val pw0 = min(container.measuredWidth, maxPopupW)
+        val ph0 = min(container.measuredHeight, maxPopupH)
+        val centerX0 = box.left + box.width / 2
+        var x0 = centerX0 - pw0 / 2
+        if (x0 < sideMargin) x0 = sideMargin
+        if (x0 + pw0 > screenW - sideMargin) x0 = screenW - sideMargin - pw0
+        var y0 = box.top - ph0 - dp(6)
+        if (y0 < sideMargin) y0 = box.top + box.height + dp(6)
+        if (y0 + ph0 > screenH - sideMargin) y0 = screenH - sideMargin - ph0
+        if (y0 < sideMargin) y0 = sideMargin
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = x0
+            y = y0
+        }
+
+        try {
+            windowManager.addView(container, params)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to add LLM popup", e)
+            return
+        }
+        val holder = PopupHolder(container, wordBody)
+        popup = holder
+
+        val token = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(PREF_BEDROCK_TOKEN, "")
+            .orEmpty()
+            .trim()
+
+        if (token.isEmpty()) {
+            wordBody.text = "(missing AWS_BEARER_TOKEN_BEDROCK — set it in the app)"
+            container.post { reposition() }
+            return
+        }
+
+        val sentence = box.fullText
+        Thread {
+            val result = runCatching { BedrockClient.analyzeJapanese(sentence, token) }
+            mainHandler.post {
+                if (popup !== holder) return@post
+                result.onSuccess { a ->
+                    wordBody.text = if (a.wordByWord.isNotBlank())
+                        renderInlineMarkdown(a.wordByWord) else "(no analysis)"
+                    if (a.phrases.isNotBlank()) {
+                        phraseBody.text = renderInlineMarkdown(a.phrases)
+                        phraseHeader.visibility = View.VISIBLE
+                        phraseBody.visibility = View.VISIBLE
+                    }
+                    if (a.translation.isNotBlank()) {
+                        transBody.text = renderInlineMarkdown(a.translation)
+                        transHeader.visibility = View.VISIBLE
+                        transBody.visibility = View.VISIBLE
+                    }
+                    if (a.notes.isNotBlank() && a.notes.trim() != "(none)") {
+                        notesBody.text = renderInlineMarkdown(a.notes)
+                        notesHeader.visibility = View.VISIBLE
+                        notesBody.visibility = View.VISIBLE
+                    }
+                }.onFailure { e ->
+                    Log.e(TAG, "LLM analysis failed", e)
+                    wordBody.text = "Error: ${e.message ?: e.javaClass.simpleName}"
+                }
+                container.post { reposition() }
+            }
+        }.start()
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         // Rebuild capture surface for new orientation. Stale boxes are now wrong, drop them.
         clearMorphemeBoxes()
+        clearSentenceBoxes()
         if (mediaProjection != null) setupVirtualDisplay()
     }
 
     override fun onDestroy() {
         clearMorphemeBoxes()
+        clearSentenceBoxes()
         floatingView?.let { runCatching { windowManager.removeView(it) } }
         floatingView = null
         virtualDisplay?.release()
