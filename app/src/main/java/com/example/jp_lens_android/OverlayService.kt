@@ -78,6 +78,9 @@ class OverlayService : Service() {
 
     private data class PopupHolder(val view: View, val translationView: TextView)
     private var popup: PopupHolder? = null
+    // Set by the LLM popup's drag handler; suppresses auto-reposition so a
+    // user-positioned popup doesn't jump when the response arrives.
+    private var userMovedPopup = false
 
     private data class MorphemeBox(
         val left: Int,
@@ -640,6 +643,7 @@ class OverlayService : Service() {
         else
             @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
+        val padY = dp(3)
         for (b in boxes) {
             val view = View(this).apply {
                 background = makeBoxDrawable(selected = false)
@@ -651,7 +655,7 @@ class OverlayService : Service() {
                 }
             }
             val params = WindowManager.LayoutParams(
-                b.width, b.height,
+                b.width, b.height + padY * 2,
                 type,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
@@ -659,7 +663,7 @@ class OverlayService : Service() {
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
                 x = b.left
-                y = b.top
+                y = b.top - padY
             }
             try {
                 windowManager.addView(view, params)
@@ -1185,6 +1189,7 @@ class OverlayService : Service() {
         else
             @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
+        val padY = dp(3)
         for (b in boxes) {
             val view = View(this).apply {
                 background = makeSentenceBoxDrawable()
@@ -1192,7 +1197,7 @@ class OverlayService : Service() {
                 setOnClickListener { onSentenceClick(b) }
             }
             val params = WindowManager.LayoutParams(
-                b.width, b.height,
+                b.width, b.height + padY * 2,
                 type,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
@@ -1200,7 +1205,7 @@ class OverlayService : Service() {
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
                 x = b.left
-                y = b.top
+                y = b.top - padY
             }
             try {
                 windowManager.addView(view, params)
@@ -1238,6 +1243,7 @@ class OverlayService : Service() {
 
     private fun showLlmAnalysisPopup(box: SentenceBox) {
         dismissPopup()
+        userMovedPopup = false
 
         val screenW = resources.displayMetrics.widthPixels
         val screenH = resources.displayMetrics.heightPixels
@@ -1384,6 +1390,7 @@ class OverlayService : Service() {
         // Re-clamp the popup's on-screen position whenever its content changes
         // size (e.g. when the LLM response arrives and sections become visible).
         fun reposition() {
+            if (userMovedPopup) return
             val wSpec = View.MeasureSpec.makeMeasureSpec(maxPopupW, View.MeasureSpec.AT_MOST)
             val hSpec = View.MeasureSpec.makeMeasureSpec(maxPopupH, View.MeasureSpec.AT_MOST)
             container.measure(wSpec, hSpec)
@@ -1443,6 +1450,35 @@ class OverlayService : Service() {
         }
         val holder = PopupHolder(container, wordBody)
         popup = holder
+
+        // Drag-to-move via the header row. The ✕ button is clickable and
+        // consumes its own touches first, so taps on it still close the popup;
+        // anything else in the header row (title text + padding) drags.
+        // Once dragged, suppress the auto-reposition that runs when content
+        // grows — otherwise the popup snaps back when the LLM response arrives.
+        var dragInitialX = 0
+        var dragInitialY = 0
+        var dragStartRawX = 0f
+        var dragStartRawY = 0f
+        headerRow.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    dragInitialX = params.x
+                    dragInitialY = params.y
+                    dragStartRawX = event.rawX
+                    dragStartRawY = event.rawY
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    params.x = dragInitialX + (event.rawX - dragStartRawX).toInt()
+                    params.y = dragInitialY + (event.rawY - dragStartRawY).toInt()
+                    userMovedPopup = true
+                    runCatching { windowManager.updateViewLayout(container, params) }
+                    true
+                }
+                else -> false
+            }
+        }
 
         val token = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getString(PREF_BEDROCK_TOKEN, "")

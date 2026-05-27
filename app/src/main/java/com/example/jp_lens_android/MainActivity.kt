@@ -32,6 +32,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.jp_lens_android.ui.theme.JplensandroidTheme
@@ -131,6 +132,7 @@ fun PermissionFlow(modifier: Modifier = Modifier) {
             },
             label = { Text("AWS_BEARER_TOKEN_BEDROCK") },
             singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
             modifier = Modifier.fillMaxWidth(),
         )
 
@@ -146,16 +148,16 @@ fun PermissionFlow(modifier: Modifier = Modifier) {
             Text("2. Start capture (word tokenizer + Google Translate)")
         }
 
+        Button(onClick = { launchCapture(OverlayService.MODE_SENTENCE_LLM) }) {
+            Text("3. LLM+full sentence block")
+        }
+
         Button(onClick = {
             val svc = Intent(context, OverlayService::class.java).apply {
                 action = OverlayService.ACTION_STOP
             }
             context.startService(svc)
             status = "Stopped."
-        }) { Text("3. Stop") }
-
-        Button(onClick = { launchCapture(OverlayService.MODE_SENTENCE_LLM) }) {
-            Text("4. Start capture (sentence boxes + Bedrock DeepSeek LLM)")
-        }
+        }) { Text("4. Stop") }
     }
 }
