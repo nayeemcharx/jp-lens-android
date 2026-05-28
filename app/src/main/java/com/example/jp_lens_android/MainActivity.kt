@@ -113,14 +113,8 @@ fun PermissionFlow(
                 putExtra(OverlayService.EXTRA_MODE, pendingMode)
             }
             ContextCompat.startForegroundService(context, svc)
-            status = when (pendingMode) {
-                OverlayService.MODE_SENTENCE_LLM ->
-                    "Overlay running (LLM sentence mode) — switch apps and tap the floating button."
-                OverlayService.MODE_SENTENCE_DICT ->
-                    "Overlay running (offline JMdict sentence mode) — switch apps and tap the floating button."
-                else ->
-                    "Overlay running — switch to your game and tap the floating button."
-            }
+            status = "Overlay running — tap the floating button to capture; " +
+                "hold it to switch mode or stop."
         } else {
             status = "Screen capture permission denied."
         }
@@ -130,25 +124,29 @@ fun PermissionFlow(
         ActivityResultContracts.RequestPermission()
     ) { /* result ignored — FGS still starts */ }
 
-    fun launchCapture(mode: Int) {
+    fun startCapture() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(
                     context, Manifest.permission.POST_NOTIFICATIONS
                 ) != PackageManager.PERMISSION_GRANTED
             ) {
                 notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                status = "Allow notifications, then press Start again."
                 return
             }
         }
         if (!Settings.canDrawOverlays(context)) {
-            status = "Overlay permission not granted yet."
+            status = "Grant overlay permission, then press Start again."
+            context.startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:${context.packageName}")
+                )
+            )
             return
         }
-        if (mode == OverlayService.MODE_SENTENCE_LLM && apiKey.isBlank()) {
-            status = "Enter AWS_BEARER_TOKEN_BEDROCK above before starting LLM mode."
-            return
-        }
-        pendingMode = mode
+        // Resume the last mode used; switchable live via the floating button's hold menu.
+        pendingMode = prefs.getInt(OverlayService.PREF_LAST_MODE, OverlayService.MODE_MORPHEME)
         projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
     }
 
@@ -172,25 +170,7 @@ fun PermissionFlow(
             modifier = Modifier.fillMaxWidth(),
         )
 
-        Button(onClick = {
-            val intent = Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:${context.packageName}")
-            )
-            context.startActivity(intent)
-        }) { Text("1. Grant overlay permission") }
-
-        Button(onClick = { launchCapture(OverlayService.MODE_MORPHEME) }) {
-            Text("2. Start capture (word tokenizer + Google Translate)")
-        }
-
-        Button(onClick = { launchCapture(OverlayService.MODE_SENTENCE_LLM) }) {
-            Text("3. LLM+full sentence block")
-        }
-
-        Button(onClick = { launchCapture(OverlayService.MODE_SENTENCE_DICT) }) {
-            Text("4. Full sentence block + word-by-word (offline JMdict)")
-        }
+        Button(onClick = { startCapture() }) { Text("Start") }
 
         Button(onClick = {
             val svc = Intent(context, OverlayService::class.java).apply {
@@ -198,6 +178,11 @@ fun PermissionFlow(
             }
             context.startService(svc)
             status = "Stopped."
-        }) { Text("5. Stop") }
+        }) { Text("Stop") }
+
+        Text(
+            "Hold the floating button to switch mode (word / LLM / 辞書) or stop, " +
+                "without reopening this screen."
+        )
     }
 }

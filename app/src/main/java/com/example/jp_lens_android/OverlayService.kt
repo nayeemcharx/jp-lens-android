@@ -35,6 +35,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -43,9 +44,12 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
 
 class OverlayService : Service() {
 
@@ -63,6 +67,13 @@ class OverlayService : Service() {
 
         const val PREFS_NAME = "jp_lens"
         const val PREF_BEDROCK_TOKEN = "aws_bearer_token_bedrock"
+        // Last capture mode chosen (start button resumes it; radial menu updates it).
+        const val PREF_LAST_MODE = "last_mode"
+
+        // How long to hold the floating button before the radial mode menu appears.
+        // Short (standard long-press); a drag past touchSlop cancels it, so a brief
+        // hold-in-place is enough and won't interfere with dragging the button.
+        private const val MENU_HOLD_MS = 500L
 
         private const val CHANNEL_ID = "jp_lens_overlay"
         private const val NOTIFICATION_ID = 1001
@@ -70,6 +81,8 @@ class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
     private var floatingView: View? = null
+    // Full-screen radial mode-switch menu (long-press the floating button).
+    private var radialMenu: View? = null
 
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
@@ -155,6 +168,7 @@ class OverlayService : Service() {
         startForegroundCompat()
 
         mode = intent.getIntExtra(EXTRA_MODE, MODE_MORPHEME)
+        persistMode()
         Log.i(TAG, "Starting mode=$mode (0=morpheme, 1=sentence+LLM, 2=sentence+JMdict)")
 
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
@@ -294,7 +308,14 @@ class OverlayService : Service() {
         var initialY = 0
         var touchStartX = 0f
         var touchStartY = 0f
+        var moved = false
+        var longPressFired = false
         val touchSlop = dp(8)
+        // Holding the button (without dragging) opens the radial mode menu.
+        val longPress = Runnable {
+            longPressFired = true
+            showRadialMenu(params)
+        }
 
         view.setOnTouchListener { v, event ->
             when (event.action) {
@@ -303,24 +324,153 @@ class OverlayService : Service() {
                     initialY = params.y
                     touchStartX = event.rawX
                     touchStartY = event.rawY
+                    moved = false
+                    longPressFired = false
+                    mainHandler.postDelayed(longPress, MENU_HOLD_MS)
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    params.x = initialX + (event.rawX - touchStartX).toInt()
-                    params.y = initialY + (event.rawY - touchStartY).toInt()
-                    windowManager.updateViewLayout(v, params)
+                    if (abs(event.rawX - touchStartX) > touchSlop ||
+                        abs(event.rawY - touchStartY) > touchSlop
+                    ) {
+                        moved = true
+                        mainHandler.removeCallbacks(longPress)  // a drag isn't a long-press
+                        params.x = initialX + (event.rawX - touchStartX).toInt()
+                        params.y = initialY + (event.rawY - touchStartY).toInt()
+                        windowManager.updateViewLayout(v, params)
+                    }
                     true
                 }
-                MotionEvent.ACTION_UP -> {
-                    val moved = abs(event.rawX - touchStartX) > touchSlop ||
-                        abs(event.rawY - touchStartY) > touchSlop
-                    if (!moved) v.performClick()
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    mainHandler.removeCallbacks(longPress)
+                    // Plain tap (no drag, no menu) = capture/clear.
+                    if (!moved && !longPressFired) v.performClick()
                     true
                 }
                 else -> false
             }
         }
         view.setOnClickListener { captureAndRecognize() }
+    }
+
+    private fun persistMode() {
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putInt(PREF_LAST_MODE, mode).apply()
+    }
+
+    /**
+     * Switches capture mode live without reopening the app. The MediaProjection is
+     * already granted, so this just swaps the `mode` field, drops stale overlays, and
+     * (for dict mode) warms the offline dictionary.
+     */
+    private fun setMode(newMode: Int) {
+        if (newMode == mode) return
+        clearMorphemeBoxes()
+        clearSentenceBoxes()
+        mode = newMode
+        persistMode()
+        if (newMode == MODE_SENTENCE_DICT) captureHandler?.post { JmDict.warmUp(this) }
+        updateOcrButtonAppearance()
+        val name = when (newMode) {
+            MODE_SENTENCE_LLM -> "LLM sentence"
+            MODE_SENTENCE_DICT -> "JMdict sentence"
+            else -> "word"
+        }
+        Toast.makeText(this, "Mode: $name", Toast.LENGTH_SHORT).show()
+    }
+
+    private data class MenuOption(val label: String, val color: Int, val action: () -> Unit)
+
+    /**
+     * Radial mode-switch menu shown on long-press of the floating button. Option
+     * buttons (the three modes + Stop) are arranged in a circle around the button;
+     * tapping the dimmed background dismisses it.
+     */
+    private fun showRadialMenu(btnParams: WindowManager.LayoutParams) {
+        if (radialMenu != null) return
+        val btnSize = dp(64)
+        val cx = btnParams.x + btnSize / 2
+        val cy = btnParams.y + btnSize / 2
+        val metrics = resources.displayMetrics
+        val screenW = metrics.widthPixels
+        val screenH = metrics.heightPixels
+
+        val options = listOf(
+            MenuOption("OCR", Color.argb(230, 30, 100, 220)) { setMode(MODE_MORPHEME) },
+            MenuOption("LLM", Color.argb(230, 140, 60, 200)) { setMode(MODE_SENTENCE_LLM) },
+            MenuOption("辞書", Color.argb(230, 40, 160, 120)) { setMode(MODE_SENTENCE_DICT) },
+            MenuOption("Stop", Color.argb(230, 220, 80, 60)) { stopSelf() },
+        )
+
+        val scrim = FrameLayout(this).apply {
+            setBackgroundColor(Color.argb(120, 0, 0, 0))
+            isClickable = true
+            setOnClickListener { dismissRadialMenu() }
+        }
+
+        val radius = dp(104)
+        val size = dp(58)
+        val margin = dp(6)
+        for ((i, opt) in options.withIndex()) {
+            // Start at the top, go clockwise.
+            val angle = (2.0 * PI * i / options.size) - PI / 2.0
+            val ox = cx + (radius * cos(angle)).toInt()
+            val oy = cy + (radius * sin(angle)).toInt()
+            val lx = (ox - size / 2).coerceIn(margin, screenW - margin - size)
+            val ly = (oy - size / 2).coerceIn(margin, screenH - margin - size)
+            val btn = makeOptionButton(opt.label, opt.color) {
+                dismissRadialMenu()
+                opt.action()
+            }
+            scrim.addView(btn, FrameLayout.LayoutParams(size, size).apply {
+                gravity = Gravity.TOP or Gravity.START
+                leftMargin = lx
+                topMargin = ly
+            })
+        }
+
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else
+            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            type,
+            // NO_LIMITS so the scrim shares the floating button's full-screen
+            // coordinate space (incl. the status-bar region); otherwise the option
+            // buttons would be offset by the top inset.
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+
+        try {
+            windowManager.addView(scrim, params)
+            radialMenu = scrim
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to add radial menu", e)
+        }
+    }
+
+    private fun makeOptionButton(label: String, color: Int, onClick: () -> Unit): TextView =
+        TextView(this).apply {
+            text = label
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            gravity = Gravity.CENTER
+            isClickable = true
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(color)
+            }
+            elevation = dp(4).toFloat()
+            setOnClickListener { onClick() }
+        }
+
+    private fun dismissRadialMenu() {
+        radialMenu?.let { runCatching { windowManager.removeView(it) } }
+        radialMenu = null
     }
 
     private fun captureAndRecognize() {
@@ -1073,7 +1223,7 @@ class OverlayService : Service() {
         addBtn.setOnClickListener {
             // Dict mode (expandable): card back = the full JMdict detail blob.
             // LLM mode: card back = the summary (reading/meaning/JLPT/sentence).
-            if (expandable) handleAddToAnkiDict(entry, addBtn)
+            if (expandable) handleAddToAnkiDict(entry, addBtn, sentence, translation)
             else handleAddToAnki(entry, addBtn, sentence, translation)
         }
         // "+" sits at the left, immediately before the word, so it stays close
@@ -1137,16 +1287,17 @@ class OverlayService : Service() {
                 })
                 Thread {
                     val details = JmDict.lookupWordDetail(entry.word)
+                    val kanji = kanjiInfoForWord(entry.word)
                     mainHandler.post {
                         detail.removeAllViews()
-                        if (details.isEmpty()) {
+                        if (details.isEmpty() && kanji.isEmpty()) {
                             detail.addView(TextView(this).apply {
                                 text = "(no dictionary entry)"
                                 setTextColor(Color.argb(255, 160, 160, 160))
                                 textSize = 12f
                             })
                         } else {
-                            detail.addView(renderWordDetail(details, textMaxW))
+                            detail.addView(renderWordDetail(details, kanji, textMaxW))
                         }
                     }
                 }.start()
@@ -1199,14 +1350,38 @@ class OverlayService : Service() {
     private fun circled(n: Int): String =
         if (n in 1..circledNumbers.length) circledNumbers[n - 1].toString() else "($n)"
 
-    /** Renders the full JMdict entry/entries for a word into a styled vertical column. */
-    private fun renderWordDetail(details: List<JmDict.WordDetail>, textMaxW: Int): View {
+    /** Distinct kanji characters appearing in [word], each with its KANJIDIC2 info. */
+    private fun kanjiInfoForWord(word: String): List<Pair<Char, JmDict.KanjiInfo>> {
+        val out = ArrayList<Pair<Char, JmDict.KanjiInfo>>()
+        val seen = HashSet<Char>()
+        for (c in word) {
+            if (!JapaneseTokenizer.containsKanji(c.toString()) || !seen.add(c)) continue
+            val ki = JmDict.lookupKanji(c) ?: continue
+            out += c to ki
+        }
+        return out
+    }
+
+    /**
+     * Renders the full JMdict entry/entries for a word into a styled vertical column,
+     * followed by a Kanji subsection for the kanji that appear in this word.
+     */
+    private fun renderWordDetail(
+        details: List<JmDict.WordDetail>,
+        kanji: List<Pair<Char, JmDict.KanjiInfo>>,
+        textMaxW: Int,
+    ): View {
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(2), 0, dp(2))
         }
         val labelW = textMaxW - dp(12)
 
+        if (details.isEmpty()) {
+            col.addView(detailLine(
+                SpannableStringBuilder().styled("(not in JMdict)", cDim, 0.9f, italic = true), labelW
+            ))
+        }
         for ((wi, wd) in details.withIndex()) {
             if (wi > 0) {
                 // Thin separator between homograph entries.
@@ -1287,6 +1462,19 @@ class OverlayService : Service() {
                 col.addView(detailLine(sb, labelW, topPad = dp(1)))
             }
         }
+
+        // Kanji used in this word (KANJIDIC2 meaning + JLPT).
+        if (kanji.isNotEmpty()) {
+            val sb = SpannableStringBuilder()
+            sb.styled("Kanji", cAccent, 0.85f, bold = true)
+            for ((ch, ki) in kanji) {
+                sb.append("\n")
+                sb.styled("  $ch", cBody)
+                sb.styled("  " + ki.meaning, cDim, 0.9f)
+                if (ki.jlpt.isNotEmpty()) sb.styled("  [${ki.jlpt}]", cPos, 0.8f)
+            }
+            col.addView(detailLine(sb, labelW, topPad = dp(2)))
+        }
         return col
     }
 
@@ -1366,13 +1554,19 @@ class OverlayService : Service() {
      * Dict-mode add: front = the word (kanji form, no kana reading); back = the full
      * JMdict detail blob rendered as HTML (all senses, POS, tags, xrefs, loanword, …).
      */
-    private fun handleAddToAnkiDict(entry: BedrockClient.WordEntry, btn: TextView) {
+    private fun handleAddToAnkiDict(
+        entry: BedrockClient.WordEntry,
+        btn: TextView,
+        sentence: String,
+        translation: String,
+    ) {
         if (!ankiPreflight()) return
         btn.isEnabled = false
         btn.alpha = 0.5f
         Thread {
             val details = JmDict.lookupWordDetail(entry.word)
-            val back = buildAnkiBackHtml(entry, details)
+            val kanji = kanjiInfoForWord(entry.word)
+            val back = buildAnkiBackHtml(entry, details, kanji, sentence, translation)
             val result = AnkiDroidHelper.addCard(this, entry.word, back)
             mainHandler.post { applyAnkiResult(result, btn, entry.word) }
         }.start()
@@ -1382,85 +1576,115 @@ class OverlayService : Service() {
         s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     /**
-     * Renders the JMdict detail for an Anki card back as HTML (Anki cards display
-     * field content through a WebView). Colors are chosen to read on Anki's default
-     * white background. Falls back to the summary meaning when [details] is empty.
+     * Renders the Anki card back as HTML (Anki cards display field content through a
+     * WebView). Sections: the full JMdict detail (or a summary fallback when the word
+     * isn't in JMdict), the kanji used in this word, and the source sentence + its
+     * translation. Colors are chosen to read on Anki's default white background.
      */
-    private fun buildAnkiBackHtml(entry: BedrockClient.WordEntry, details: List<JmDict.WordDetail>): String {
+    private fun buildAnkiBackHtml(
+        entry: BedrockClient.WordEntry,
+        details: List<JmDict.WordDetail>,
+        kanji: List<Pair<Char, JmDict.KanjiInfo>>,
+        sentence: String,
+        translation: String,
+    ): String {
+        val accent = "#1565c0"   // headers / sense numbers
+        val pos = "#2e7d32"      // part of speech / JLPT
+        val dim = "#777777"      // tags / notes / forms-status / translation
+        val sb = StringBuilder()
+        sb.append("<div style=\"text-align:left\">")
+
+        // JMdict detail, or a minimal fallback when the word isn't in JMdict.
         if (details.isEmpty()) {
-            val sb = StringBuilder()
             if (entry.reading.isNotEmpty() && entry.reading != entry.word)
                 sb.append("<div>").append(htmlEscape(entry.reading)).append("</div>")
             sb.append("<div>").append(htmlEscape(entry.meaning)).append("</div>")
-            return sb.toString()
-        }
-        val accent = "#1565c0"   // headers / sense numbers
-        val pos = "#2e7d32"      // part of speech
-        val dim = "#777777"      // tags / notes / forms-status
-        val sb = StringBuilder()
-        sb.append("<div style=\"text-align:left\">")
-        for ((wi, wd) in details.withIndex()) {
-            if (wi > 0) sb.append("<hr>")
-            if (wd.writings.isNotEmpty()) {
-                sb.append("<div style=\"color:$accent;font-weight:bold\">Writings</div>")
-                for (w in wd.writings) {
-                    sb.append("<div>").append(htmlEscape(w.text))
-                    if (w.common) sb.append(" <span style=\"color:$pos\">●</span>")
-                    for (t in w.tags)
-                        sb.append(" <span style=\"color:$dim;font-style:italic\">")
-                            .append(htmlEscape(JmDict.tagLabel(t))).append("</span>")
-                    sb.append("</div>")
-                }
-            }
-            if (wd.readings.isNotEmpty()) {
-                sb.append("<div style=\"color:$accent;font-weight:bold\">Readings</div>")
-                for (r in wd.readings) {
-                    sb.append("<div>").append(htmlEscape(r.text))
-                    if (r.common) sb.append(" <span style=\"color:$pos\">●</span>")
-                    for (t in r.tags)
-                        sb.append(" <span style=\"color:$dim;font-style:italic\">")
-                            .append(htmlEscape(JmDict.tagLabel(t))).append("</span>")
-                    val ak = r.appliesToKanji.filter { it != "*" }
-                    if (ak.isNotEmpty())
-                        sb.append(" <span style=\"color:$dim\">→ ")
-                            .append(htmlEscape(ak.joinToString("、"))).append("</span>")
-                    sb.append("</div>")
-                }
-            }
-            for ((si, sense) in wd.senses.withIndex()) {
-                sb.append("<div style=\"margin-top:4px\">")
-                sb.append("<span style=\"color:$accent;font-weight:bold\">")
-                    .append(circled(si + 1)).append("</span> ")
-                if (sense.partOfSpeech.isNotEmpty())
-                    sb.append("<span style=\"color:$pos;font-style:italic\">")
-                        .append(htmlEscape(sense.partOfSpeech.joinToString(", ") { JmDict.tagLabel(it) }))
-                        .append("</span> ")
-                sb.append(htmlEscape(sense.glosses.joinToString("; ")))
-                val chips = (sense.misc + sense.fields + sense.dialects).map { JmDict.tagLabel(it) }
-                if (chips.isNotEmpty())
-                    sb.append(" <span style=\"color:$dim;font-style:italic\">")
-                        .append(htmlEscape(chips.joinToString(" ") { "[$it]" })).append("</span>")
-                for (ls in sense.langSources) {
-                    val txt = buildString {
-                        append("from ").append(ls.lang)
-                        if (!ls.text.isNullOrEmpty()) append(": ").append(ls.text)
-                        if (ls.wasei) append(" (wasei)")
+        } else {
+            for ((wi, wd) in details.withIndex()) {
+                if (wi > 0) sb.append("<hr>")
+                if (wd.writings.isNotEmpty()) {
+                    sb.append("<div style=\"color:$accent;font-weight:bold\">Writings</div>")
+                    for (w in wd.writings) {
+                        sb.append("<div>").append(htmlEscape(w.text))
+                        if (w.common) sb.append(" <span style=\"color:$pos\">●</span>")
+                        for (t in w.tags)
+                            sb.append(" <span style=\"color:$dim;font-style:italic\">")
+                                .append(htmlEscape(JmDict.tagLabel(t))).append("</span>")
+                        sb.append("</div>")
                     }
-                    sb.append(" <span style=\"color:$dim;font-style:italic\">")
-                        .append(htmlEscape(txt)).append("</span>")
                 }
-                if (sense.info.isNotEmpty())
-                    sb.append("<div style=\"color:$dim\">note: ")
-                        .append(htmlEscape(sense.info.joinToString("; "))).append("</div>")
-                if (sense.related.isNotEmpty())
-                    sb.append("<div style=\"color:$dim\">→ see ")
-                        .append(htmlEscape(sense.related.joinToString("、"))).append("</div>")
-                if (sense.antonyms.isNotEmpty())
-                    sb.append("<div style=\"color:$dim\">⇄ ")
-                        .append(htmlEscape(sense.antonyms.joinToString("、"))).append("</div>")
+                if (wd.readings.isNotEmpty()) {
+                    sb.append("<div style=\"color:$accent;font-weight:bold\">Readings</div>")
+                    for (r in wd.readings) {
+                        sb.append("<div>").append(htmlEscape(r.text))
+                        if (r.common) sb.append(" <span style=\"color:$pos\">●</span>")
+                        for (t in r.tags)
+                            sb.append(" <span style=\"color:$dim;font-style:italic\">")
+                                .append(htmlEscape(JmDict.tagLabel(t))).append("</span>")
+                        val ak = r.appliesToKanji.filter { it != "*" }
+                        if (ak.isNotEmpty())
+                            sb.append(" <span style=\"color:$dim\">→ ")
+                                .append(htmlEscape(ak.joinToString("、"))).append("</span>")
+                        sb.append("</div>")
+                    }
+                }
+                for ((si, sense) in wd.senses.withIndex()) {
+                    sb.append("<div style=\"margin-top:4px\">")
+                    sb.append("<span style=\"color:$accent;font-weight:bold\">")
+                        .append(circled(si + 1)).append("</span> ")
+                    if (sense.partOfSpeech.isNotEmpty())
+                        sb.append("<span style=\"color:$pos;font-style:italic\">")
+                            .append(htmlEscape(sense.partOfSpeech.joinToString(", ") { JmDict.tagLabel(it) }))
+                            .append("</span> ")
+                    sb.append(htmlEscape(sense.glosses.joinToString("; ")))
+                    val chips = (sense.misc + sense.fields + sense.dialects).map { JmDict.tagLabel(it) }
+                    if (chips.isNotEmpty())
+                        sb.append(" <span style=\"color:$dim;font-style:italic\">")
+                            .append(htmlEscape(chips.joinToString(" ") { "[$it]" })).append("</span>")
+                    for (ls in sense.langSources) {
+                        val txt = buildString {
+                            append("from ").append(ls.lang)
+                            if (!ls.text.isNullOrEmpty()) append(": ").append(ls.text)
+                            if (ls.wasei) append(" (wasei)")
+                        }
+                        sb.append(" <span style=\"color:$dim;font-style:italic\">")
+                            .append(htmlEscape(txt)).append("</span>")
+                    }
+                    if (sense.info.isNotEmpty())
+                        sb.append("<div style=\"color:$dim\">note: ")
+                            .append(htmlEscape(sense.info.joinToString("; "))).append("</div>")
+                    if (sense.related.isNotEmpty())
+                        sb.append("<div style=\"color:$dim\">→ see ")
+                            .append(htmlEscape(sense.related.joinToString("、"))).append("</div>")
+                    if (sense.antonyms.isNotEmpty())
+                        sb.append("<div style=\"color:$dim\">⇄ ")
+                            .append(htmlEscape(sense.antonyms.joinToString("、"))).append("</div>")
+                    sb.append("</div>")
+                }
+            }
+        }
+
+        // Kanji used in this word.
+        if (kanji.isNotEmpty()) {
+            sb.append("<div style=\"color:$accent;font-weight:bold;margin-top:6px\">Kanji</div>")
+            for ((ch, ki) in kanji) {
+                sb.append("<div>").append(htmlEscape(ch.toString()))
+                    .append(" — ").append(htmlEscape(ki.meaning))
+                if (ki.jlpt.isNotEmpty())
+                    sb.append(" <span style=\"color:$pos\">[")
+                        .append(htmlEscape(ki.jlpt)).append("]</span>")
                 sb.append("</div>")
             }
         }
+
+        // Source sentence + its translation.
+        if (sentence.isNotEmpty()) {
+            sb.append("<div style=\"color:$accent;font-weight:bold;margin-top:6px\">Sentence</div>")
+            sb.append("<div>").append(htmlEscape(sentence)).append("</div>")
+            if (translation.isNotEmpty())
+                sb.append("<div style=\"color:$dim\">").append(htmlEscape(translation)).append("</div>")
+        }
+
         sb.append("</div>")
         return sb.toString()
     }
@@ -2074,21 +2298,8 @@ class OverlayService : Service() {
                 }
             }
 
-            // Kanji section: each distinct kanji → KANJIDIC2 meaning + JLPT, in the
-            // same em-dash format the LLM kanji body uses.
-            val kanjiText = if (available) {
-                val sb = StringBuilder()
-                val seenK = HashSet<Char>()
-                for (c in sentence) {
-                    if (!JapaneseTokenizer.containsKanji(c.toString()) || !seenK.add(c)) continue
-                    val ki = JmDict.lookupKanji(c) ?: continue
-                    sb.append(c).append(" — ").append(ki.meaning)
-                    if (ki.jlpt.isNotEmpty()) sb.append("  [").append(ki.jlpt).append(']')
-                    sb.append('\n')
-                }
-                sb.toString().trim()
-            } else ""
-
+            // No standalone Kanji section in dict mode — each word's own kanji are
+            // folded into that word's expandable detail panel (see buildWordRow).
             val translation = runCatching { Translator.translateJaToEn(sentence) }.getOrDefault("")
 
             mainHandler.post {
@@ -2107,11 +2318,6 @@ class OverlayService : Service() {
                     ui.wordList.visibility = View.VISIBLE
                 } else {
                     ui.wordBody.text = "(no words found)"
-                }
-                if (kanjiText.isNotEmpty()) {
-                    ui.kanjiBody.text = kanjiText
-                    ui.kanjiHeader.visibility = View.VISIBLE
-                    ui.kanjiBody.visibility = View.VISIBLE
                 }
                 if (translation.isNotBlank()) {
                     ui.transBody.text = translation
@@ -2136,6 +2342,7 @@ class OverlayService : Service() {
     override fun onDestroy() {
         clearMorphemeBoxes()
         clearSentenceBoxes()
+        dismissRadialMenu()
         floatingView?.let { runCatching { windowManager.removeView(it) } }
         floatingView = null
         virtualDisplay?.release()
