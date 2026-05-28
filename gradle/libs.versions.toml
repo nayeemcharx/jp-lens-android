@@ -11,11 +11,13 @@ composeBom = "2026.02.01"
 mlkitTextJapanese = "16.0.1"
 kotlinxCoroutinesPlayServices = "1.8.1"
 kuromojiIpadic = "0.9.0"
+ankiDroidApi = "api-v1.1.0"
 
 [libraries]
 mlkit-text-recognition-japanese = { group = "com.google.mlkit", name = "text-recognition-japanese", version.ref = "mlkitTextJapanese" }
 kotlinx-coroutines-play-services = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-play-services", version.ref = "kotlinxCoroutinesPlayServices" }
 kuromoji-ipadic = { group = "com.atilika.kuromoji", name = "kuromoji-ipadic", version.ref = "kuromojiIpadic" }
+anki-droid-api = { group = "com.github.ankidroid", name = "Anki-Android", version.ref = "ankiDroidApi" }
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }

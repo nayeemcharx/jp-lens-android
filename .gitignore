@@ -13,3 +13,6 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Generated offline dictionary (built by scripts/build_jmdict_db.py); too large to commit.
+/app/src/main/assets/jmdict.db

@@ -15,6 +15,8 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.text.Spannable
 import android.text.SpannableStringBuilder
+import android.text.style.ForegroundColorSpan
+import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -35,6 +37,7 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
@@ -56,6 +59,7 @@ class OverlayService : Service() {
 
         const val MODE_MORPHEME = 0
         const val MODE_SENTENCE_LLM = 1
+        const val MODE_SENTENCE_DICT = 2
 
         const val PREFS_NAME = "jp_lens"
         const val PREF_BEDROCK_TOKEN = "aws_bearer_token_bedrock"
@@ -151,7 +155,7 @@ class OverlayService : Service() {
         startForegroundCompat()
 
         mode = intent.getIntExtra(EXTRA_MODE, MODE_MORPHEME)
-        Log.i(TAG, "Starting mode=$mode (0=morpheme, 1=sentence+LLM)")
+        Log.i(TAG, "Starting mode=$mode (0=morpheme, 1=sentence+LLM, 2=sentence+JMdict)")
 
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
         val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -179,6 +183,14 @@ class OverlayService : Service() {
             val t0 = System.currentTimeMillis()
             JapaneseTokenizer.warmUp()
             Log.i(TAG, "Kuromoji warm-up: ${System.currentTimeMillis() - t0} ms")
+        }
+        // Dict mode also copies + opens the offline JMdict SQLite asset up front.
+        if (mode == MODE_SENTENCE_DICT) {
+            captureHandler?.post {
+                val t0 = System.currentTimeMillis()
+                JmDict.warmUp(this)
+                Log.i(TAG, "JMdict warm-up: ${System.currentTimeMillis() - t0} ms (available=${JmDict.isAvailable()})")
+            }
         }
 
         setupVirtualDisplay()
@@ -256,6 +268,7 @@ class OverlayService : Service() {
         btn.text = when {
             active -> "✕"
             mode == MODE_SENTENCE_LLM -> "LLM"
+            mode == MODE_SENTENCE_DICT -> "辞書"
             else -> "OCR"
         }
         btn.background = GradientDrawable().apply {
@@ -266,8 +279,11 @@ class OverlayService : Service() {
             } else {
                 shape = GradientDrawable.OVAL
                 setColor(
-                    if (mode == MODE_SENTENCE_LLM) Color.argb(220, 140, 60, 200)
-                    else Color.argb(220, 30, 100, 220)
+                    when (mode) {
+                        MODE_SENTENCE_LLM -> Color.argb(220, 140, 60, 200)
+                        MODE_SENTENCE_DICT -> Color.argb(220, 40, 160, 120)
+                        else -> Color.argb(220, 30, 100, 220)
+                    }
                 )
             }
         }
@@ -373,7 +389,7 @@ class OverlayService : Service() {
                     Log.i(TAG, "[block] ${block.text.replace("\n", " / ")}")
                 }
                 Log.i(TAG, "[full]\n${result.text}")
-                if (mode == MODE_SENTENCE_LLM) {
+                if (isSentenceMode()) {
                     captureHandler?.post {
                         val sboxes = computeSentenceBoxes(result)
                         Log.i(TAG, "Sentence boxes: ${sboxes.size}")
@@ -399,6 +415,10 @@ class OverlayService : Service() {
                 isProcessing = false
             }
     }
+
+    /** Both sentence modes share the OCR → sentence-box pipeline; only the popup differs. */
+    private fun isSentenceMode(): Boolean =
+        mode == MODE_SENTENCE_LLM || mode == MODE_SENTENCE_DICT
 
     private fun computeMorphemeBoxes(visionText: Text): List<MorphemeBox> {
         val out = mutableListOf<MorphemeBox>()
@@ -1010,6 +1030,441 @@ class OverlayService : Service() {
      * emits emphasis markup which would otherwise show up as literal asterisks
      * in the popup. Anything that isn't a `**…**` pair is passed through verbatim.
      */
+    /**
+     * Build one row of the Word-by-word section: word text on the left, a small
+     * "+" button on the right that adds the word to AnkiDroid as a card.
+     */
+    private fun buildWordRow(
+        entry: BedrockClient.WordEntry,
+        textMaxW: Int,
+        sentence: String,
+        translation: String,
+        expandable: Boolean = false,
+    ): View {
+        val labelText = buildString {
+            append(entry.word)
+            if (entry.reading.isNotEmpty() && entry.reading != entry.word) {
+                append(" (").append(entry.reading).append(')')
+            }
+            append(" — ").append(entry.meaning)
+            if (entry.jlpt.isNotEmpty()) append("  [").append(entry.jlpt).append(']')
+        }
+        val addBtn = TextView(this).apply {
+            text = "+"
+            setTextColor(Color.argb(255, 200, 240, 200))
+            textSize = 18f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(dp(10), dp(2), dp(10), dp(2))
+            isClickable = true
+            background = GradientDrawable().apply {
+                setColor(Color.argb(60, 200, 240, 200))
+                cornerRadius = dp(6).toFloat()
+            }
+            contentDescription = "Add to AnkiDroid"
+        }
+        // Reserve width for the leading "+" (and trailing chevron, if expandable)
+        // so long text still wraps inside the popup.
+        val label = TextView(this).apply {
+            text = labelText
+            setTextColor(Color.argb(255, 230, 230, 230))
+            textSize = 13f
+            maxWidth = textMaxW - dp(44) - if (expandable) dp(34) else 0
+        }
+        addBtn.setOnClickListener {
+            // Dict mode (expandable): card back = the full JMdict detail blob.
+            // LLM mode: card back = the summary (reading/meaning/JLPT/sentence).
+            if (expandable) handleAddToAnkiDict(entry, addBtn)
+            else handleAddToAnki(entry, addBtn, sentence, translation)
+        }
+        // "+" sits at the left, immediately before the word, so it stays close
+        // to the word regardless of how wide the popup gets.
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(2), 0, dp(2))
+            addView(addBtn, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { rightMargin = dp(8) })
+            addView(label, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+        }
+
+        if (!expandable) return row
+
+        // Expandable variant (dict mode): a chevron toggles a detail panel that
+        // lazily loads the full JMdict entry for this word.
+        val chevron = TextView(this).apply {
+            text = "▸"
+            setTextColor(Color.argb(255, 150, 200, 255))
+            textSize = 16f
+            setPadding(dp(10), dp(2), dp(6), dp(2))
+            isClickable = true
+            contentDescription = "Show dictionary details"
+        }
+        row.addView(chevron, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { leftMargin = dp(4) })
+
+        val detail = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            // Indent under the word, leaving a touch of left padding.
+            setPadding(dp(12), 0, 0, dp(4))
+        }
+        // Note: we deliberately do NOT reposition the popup on expand/collapse —
+        // the popup stays anchored at its top-left and just grows downward, so the
+        // sections (incl. Translation) don't jump sideways when content resizes.
+        var loaded = false
+        chevron.setOnClickListener {
+            if (detail.visibility == View.VISIBLE) {
+                detail.visibility = View.GONE
+                chevron.text = "▸"
+                return@setOnClickListener
+            }
+            detail.visibility = View.VISIBLE
+            chevron.text = "▾"
+            if (!loaded) {
+                loaded = true
+                detail.removeAllViews()
+                detail.addView(TextView(this).apply {
+                    text = "Loading…"
+                    setTextColor(Color.argb(255, 160, 160, 160))
+                    textSize = 12f
+                })
+                Thread {
+                    val details = JmDict.lookupWordDetail(entry.word)
+                    mainHandler.post {
+                        detail.removeAllViews()
+                        if (details.isEmpty()) {
+                            detail.addView(TextView(this).apply {
+                                text = "(no dictionary entry)"
+                                setTextColor(Color.argb(255, 160, 160, 160))
+                                textSize = 12f
+                            })
+                        } else {
+                            detail.addView(renderWordDetail(details, textMaxW))
+                        }
+                    }
+                }.start()
+            }
+        }
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+            addView(detail, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+        }
+    }
+
+    // Colors for the expandable JMdict detail panel.
+    private val cAccent = Color.argb(255, 180, 220, 255)   // labels / sense numbers
+    private val cBody = Color.argb(255, 235, 235, 235)     // glosses
+    private val cPos = Color.argb(255, 150, 205, 150)      // part of speech
+    private val cDim = Color.argb(255, 160, 160, 160)      // tags / notes / forms
+
+    private fun SpannableStringBuilder.styled(
+        text: CharSequence,
+        color: Int,
+        sizeRatio: Float = 1f,
+        italic: Boolean = false,
+        bold: Boolean = false,
+    ): SpannableStringBuilder {
+        val start = length
+        append(text)
+        setSpan(ForegroundColorSpan(color), start, length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        if (sizeRatio != 1f)
+            setSpan(RelativeSizeSpan(sizeRatio), start, length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        if (italic || bold) {
+            val style = when {
+                italic && bold -> Typeface.BOLD_ITALIC
+                italic -> Typeface.ITALIC
+                else -> Typeface.BOLD
+            }
+            setSpan(StyleSpan(style), start, length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        return this
+    }
+
+    private val circledNumbers = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+    private fun circled(n: Int): String =
+        if (n in 1..circledNumbers.length) circledNumbers[n - 1].toString() else "($n)"
+
+    /** Renders the full JMdict entry/entries for a word into a styled vertical column. */
+    private fun renderWordDetail(details: List<JmDict.WordDetail>, textMaxW: Int): View {
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(2), 0, dp(2))
+        }
+        val labelW = textMaxW - dp(12)
+
+        for ((wi, wd) in details.withIndex()) {
+            if (wi > 0) {
+                // Thin separator between homograph entries.
+                col.addView(View(this).apply {
+                    setBackgroundColor(Color.argb(40, 255, 255, 255))
+                }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1))
+                    .apply { topMargin = dp(6); bottomMargin = dp(6) })
+            }
+
+            // Writings — each on its own line: text, green ● if common, then any
+            // status tags decoded (rarely-used kanji, search-only, irregular, …).
+            if (wd.writings.isNotEmpty()) {
+                val sb = SpannableStringBuilder()
+                sb.styled("Writings", cAccent, 0.85f, bold = true)
+                for (w in wd.writings) {
+                    sb.append("\n")
+                    sb.styled("  " + w.text, cBody)
+                    if (w.common) sb.styled("  ●", cPos, 0.8f)
+                    for (t in w.tags) sb.styled("  " + JmDict.tagLabel(t), cDim, 0.8f, italic = true)
+                }
+                col.addView(detailLine(sb, labelW))
+            }
+            // Readings — text, ● if common, status tags, and (when restricted) which
+            // kanji writings the reading applies to.
+            if (wd.readings.isNotEmpty()) {
+                val sb = SpannableStringBuilder()
+                sb.styled("Readings", cAccent, 0.85f, bold = true)
+                for (r in wd.readings) {
+                    sb.append("\n")
+                    sb.styled("  " + r.text, cBody)
+                    if (r.common) sb.styled("  ●", cPos, 0.8f)
+                    for (t in r.tags) sb.styled("  " + JmDict.tagLabel(t), cDim, 0.8f, italic = true)
+                    val ak = r.appliesToKanji.filter { it != "*" }
+                    if (ak.isNotEmpty())
+                        sb.styled("  → " + ak.joinToString("、"), cDim, 0.8f, italic = true)
+                }
+                col.addView(detailLine(sb, labelW))
+            }
+
+            for ((si, sense) in wd.senses.withIndex()) {
+                val sb = SpannableStringBuilder()
+                sb.styled(circled(si + 1) + " ", cAccent, bold = true)
+                if (sense.partOfSpeech.isNotEmpty()) {
+                    sb.styled(
+                        sense.partOfSpeech.joinToString(", ") { JmDict.tagLabel(it) } + "  ",
+                        cPos, 0.85f, italic = true
+                    )
+                }
+                sb.styled(sense.glosses.joinToString("; "), cBody)
+
+                // Inline tag chips: misc, field, dialect.
+                val chips = (sense.misc + sense.fields + sense.dialects).map { JmDict.tagLabel(it) }
+                if (chips.isNotEmpty()) {
+                    sb.styled("  " + chips.joinToString(" ") { "[$it]" }, cDim, 0.85f, italic = true)
+                }
+                // Loanword origin.
+                for (ls in sense.langSources) {
+                    val txt = buildString {
+                        append("  from ").append(ls.lang)
+                        if (!ls.text.isNullOrEmpty()) append(": ").append(ls.text)
+                        if (ls.wasei) append(" (wasei)")
+                    }
+                    sb.styled(txt, cDim, 0.85f, italic = true)
+                }
+                if (sense.info.isNotEmpty()) {
+                    sb.append("\n")
+                    sb.styled("   note: " + sense.info.joinToString("; "), cDim, 0.85f)
+                }
+                if (sense.related.isNotEmpty()) {
+                    sb.append("\n")
+                    sb.styled("   → see " + sense.related.joinToString("、"), cDim, 0.85f)
+                }
+                if (sense.antonyms.isNotEmpty()) {
+                    sb.append("\n")
+                    sb.styled("   ⇄ " + sense.antonyms.joinToString("、"), cDim, 0.85f)
+                }
+
+                col.addView(detailLine(sb, labelW, topPad = dp(1)))
+            }
+        }
+        return col
+    }
+
+    private fun detailLine(content: CharSequence, maxW: Int, topPad: Int = 0): TextView =
+        TextView(this).apply {
+            text = content
+            textSize = 13f
+            maxWidth = maxW
+            setPadding(0, topPad, 0, dp(3))
+        }
+
+    /** Shared AnkiDroid guards. Returns false (after toasting / prompting) if not ready. */
+    private fun ankiPreflight(): Boolean {
+        if (!AnkiDroidHelper.isAnkiInstalled(this)) {
+            Toast.makeText(this, "AnkiDroid is not installed", Toast.LENGTH_LONG).show()
+            return false
+        }
+        if (!AnkiDroidHelper.hasPermission(this)) {
+            // Permission can only be requested from an Activity. Launch
+            // MainActivity with a flag so it prompts on resume.
+            val intent = Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                putExtra(MainActivity.EXTRA_REQUEST_ANKI_PERMISSION, true)
+            }
+            startActivity(intent)
+            Toast.makeText(
+                this,
+                "Grant AnkiDroid permission in JP Lens, then tap + again.",
+                Toast.LENGTH_LONG
+            ).show()
+            return false
+        }
+        return true
+    }
+
+    /** Updates the "+" button + toasts based on the add result. Call on the main thread. */
+    private fun applyAnkiResult(result: AnkiDroidHelper.AddResult, btn: TextView, word: String) {
+        when (result) {
+            is AnkiDroidHelper.AddResult.Added -> {
+                btn.text = "✓"
+                btn.setTextColor(Color.argb(255, 120, 200, 120))
+                Toast.makeText(this, "Added \"$word\" to Anki", Toast.LENGTH_SHORT).show()
+            }
+            is AnkiDroidHelper.AddResult.Duplicate -> {
+                btn.text = "✓"
+                btn.setTextColor(Color.argb(255, 180, 180, 180))
+                Toast.makeText(this, "\"$word\" already in Anki", Toast.LENGTH_SHORT).show()
+            }
+            is AnkiDroidHelper.AddResult.Failed -> {
+                Toast.makeText(this, "Anki: ${result.message}", Toast.LENGTH_LONG).show()
+                btn.isEnabled = true
+                btn.alpha = 1f
+            }
+        }
+    }
+
+    /** LLM-mode add: front = word, back = the summary (reading/meaning/JLPT/sentence). */
+    private fun handleAddToAnki(
+        entry: BedrockClient.WordEntry,
+        btn: TextView,
+        sentence: String,
+        translation: String,
+    ) {
+        if (!ankiPreflight()) return
+        // Disable the button during the (blocking) add so duplicate taps don't double-add.
+        btn.isEnabled = false
+        btn.alpha = 0.5f
+        Thread {
+            val result = AnkiDroidHelper.addCard(
+                this, entry.word, entry.reading, entry.meaning, entry.jlpt, sentence, translation
+            )
+            mainHandler.post { applyAnkiResult(result, btn, entry.word) }
+        }.start()
+    }
+
+    /**
+     * Dict-mode add: front = the word (kanji form, no kana reading); back = the full
+     * JMdict detail blob rendered as HTML (all senses, POS, tags, xrefs, loanword, …).
+     */
+    private fun handleAddToAnkiDict(entry: BedrockClient.WordEntry, btn: TextView) {
+        if (!ankiPreflight()) return
+        btn.isEnabled = false
+        btn.alpha = 0.5f
+        Thread {
+            val details = JmDict.lookupWordDetail(entry.word)
+            val back = buildAnkiBackHtml(entry, details)
+            val result = AnkiDroidHelper.addCard(this, entry.word, back)
+            mainHandler.post { applyAnkiResult(result, btn, entry.word) }
+        }.start()
+    }
+
+    private fun htmlEscape(s: String): String =
+        s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    /**
+     * Renders the JMdict detail for an Anki card back as HTML (Anki cards display
+     * field content through a WebView). Colors are chosen to read on Anki's default
+     * white background. Falls back to the summary meaning when [details] is empty.
+     */
+    private fun buildAnkiBackHtml(entry: BedrockClient.WordEntry, details: List<JmDict.WordDetail>): String {
+        if (details.isEmpty()) {
+            val sb = StringBuilder()
+            if (entry.reading.isNotEmpty() && entry.reading != entry.word)
+                sb.append("<div>").append(htmlEscape(entry.reading)).append("</div>")
+            sb.append("<div>").append(htmlEscape(entry.meaning)).append("</div>")
+            return sb.toString()
+        }
+        val accent = "#1565c0"   // headers / sense numbers
+        val pos = "#2e7d32"      // part of speech
+        val dim = "#777777"      // tags / notes / forms-status
+        val sb = StringBuilder()
+        sb.append("<div style=\"text-align:left\">")
+        for ((wi, wd) in details.withIndex()) {
+            if (wi > 0) sb.append("<hr>")
+            if (wd.writings.isNotEmpty()) {
+                sb.append("<div style=\"color:$accent;font-weight:bold\">Writings</div>")
+                for (w in wd.writings) {
+                    sb.append("<div>").append(htmlEscape(w.text))
+                    if (w.common) sb.append(" <span style=\"color:$pos\">●</span>")
+                    for (t in w.tags)
+                        sb.append(" <span style=\"color:$dim;font-style:italic\">")
+                            .append(htmlEscape(JmDict.tagLabel(t))).append("</span>")
+                    sb.append("</div>")
+                }
+            }
+            if (wd.readings.isNotEmpty()) {
+                sb.append("<div style=\"color:$accent;font-weight:bold\">Readings</div>")
+                for (r in wd.readings) {
+                    sb.append("<div>").append(htmlEscape(r.text))
+                    if (r.common) sb.append(" <span style=\"color:$pos\">●</span>")
+                    for (t in r.tags)
+                        sb.append(" <span style=\"color:$dim;font-style:italic\">")
+                            .append(htmlEscape(JmDict.tagLabel(t))).append("</span>")
+                    val ak = r.appliesToKanji.filter { it != "*" }
+                    if (ak.isNotEmpty())
+                        sb.append(" <span style=\"color:$dim\">→ ")
+                            .append(htmlEscape(ak.joinToString("、"))).append("</span>")
+                    sb.append("</div>")
+                }
+            }
+            for ((si, sense) in wd.senses.withIndex()) {
+                sb.append("<div style=\"margin-top:4px\">")
+                sb.append("<span style=\"color:$accent;font-weight:bold\">")
+                    .append(circled(si + 1)).append("</span> ")
+                if (sense.partOfSpeech.isNotEmpty())
+                    sb.append("<span style=\"color:$pos;font-style:italic\">")
+                        .append(htmlEscape(sense.partOfSpeech.joinToString(", ") { JmDict.tagLabel(it) }))
+                        .append("</span> ")
+                sb.append(htmlEscape(sense.glosses.joinToString("; ")))
+                val chips = (sense.misc + sense.fields + sense.dialects).map { JmDict.tagLabel(it) }
+                if (chips.isNotEmpty())
+                    sb.append(" <span style=\"color:$dim;font-style:italic\">")
+                        .append(htmlEscape(chips.joinToString(" ") { "[$it]" })).append("</span>")
+                for (ls in sense.langSources) {
+                    val txt = buildString {
+                        append("from ").append(ls.lang)
+                        if (!ls.text.isNullOrEmpty()) append(": ").append(ls.text)
+                        if (ls.wasei) append(" (wasei)")
+                    }
+                    sb.append(" <span style=\"color:$dim;font-style:italic\">")
+                        .append(htmlEscape(txt)).append("</span>")
+                }
+                if (sense.info.isNotEmpty())
+                    sb.append("<div style=\"color:$dim\">note: ")
+                        .append(htmlEscape(sense.info.joinToString("; "))).append("</div>")
+                if (sense.related.isNotEmpty())
+                    sb.append("<div style=\"color:$dim\">→ see ")
+                        .append(htmlEscape(sense.related.joinToString("、"))).append("</div>")
+                if (sense.antonyms.isNotEmpty())
+                    sb.append("<div style=\"color:$dim\">⇄ ")
+                        .append(htmlEscape(sense.antonyms.joinToString("、"))).append("</div>")
+                sb.append("</div>")
+            }
+        }
+        sb.append("</div>")
+        return sb.toString()
+    }
+
     private fun renderInlineMarkdown(s: String): CharSequence {
         if (s.isEmpty() || !s.contains("**")) return s
         val out = SpannableStringBuilder()
@@ -1238,10 +1693,37 @@ class OverlayService : Service() {
 
     private fun onSentenceClick(box: SentenceBox) {
         Log.i(TAG, "sentence tap → ${box.fullText}")
-        showLlmAnalysisPopup(box)
+        if (mode == MODE_SENTENCE_DICT) showDictAnalysisPopup(box)
+        else showLlmAnalysisPopup(box)
     }
 
-    private fun showLlmAnalysisPopup(box: SentenceBox) {
+    /**
+     * The analysis popup scaffold shared by LLM mode and dict mode. Holds the
+     * section views each mode populates differently, plus the [reposition] helper
+     * that re-clamps the popup once its content grows.
+     */
+    private class AnalysisPopup(
+        val holder: PopupHolder,
+        val container: View,
+        val wordBody: TextView,
+        val wordList: LinearLayout,
+        val kanjiHeader: TextView,
+        val kanjiBody: TextView,
+        val transHeader: TextView,
+        val transBody: TextView,
+        val notesHeader: TextView,
+        val notesBody: TextView,
+        val textMaxW: Int,
+        val reposition: () -> Unit,
+    )
+
+    /**
+     * Builds + shows the empty analysis popup for [box] (header/drag handle,
+     * scrollable Word-by-word / Kanji / Translation / Notes sections), positions
+     * it, and registers it as the current [popup]. Returns the view handles so the
+     * caller can fill them in, or null if the window couldn't be added.
+     */
+    private fun buildAnalysisPopup(box: SentenceBox): AnalysisPopup? {
         dismissPopup()
         userMovedPopup = false
 
@@ -1296,14 +1778,20 @@ class OverlayService : Service() {
             textSize = 13f
             maxWidth = textMaxW
         }
-        val phraseHeader = TextView(this).apply {
-            text = "Phrases"
+        // Structured per-word rows replace `wordBody` once the LLM response is parsed.
+        // Each row carries a "+ Anki" button that adds the word as a card.
+        val wordList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        val kanjiHeader = TextView(this).apply {
+            text = "Kanji"
             setTextColor(Color.argb(255, 180, 220, 255))
             textSize = 12f
             setPadding(0, dp(6), 0, dp(2))
             visibility = View.GONE
         }
-        val phraseBody = TextView(this).apply {
+        val kanjiBody = TextView(this).apply {
             setTextColor(Color.argb(255, 230, 230, 230))
             textSize = 13f
             maxWidth = textMaxW
@@ -1340,8 +1828,9 @@ class OverlayService : Service() {
             orientation = LinearLayout.VERTICAL
             addView(wordHeader)
             addView(wordBody)
-            addView(phraseHeader)
-            addView(phraseBody)
+            addView(wordList)
+            addView(kanjiHeader)
+            addView(kanjiBody)
             addView(transHeader)
             addView(transBody)
             addView(notesHeader)
@@ -1445,8 +1934,8 @@ class OverlayService : Service() {
         try {
             windowManager.addView(container, params)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to add LLM popup", e)
-            return
+            Log.e(TAG, "Failed to add analysis popup", e)
+            return null
         }
         val holder = PopupHolder(container, wordBody)
         popup = holder
@@ -1480,14 +1969,34 @@ class OverlayService : Service() {
             }
         }
 
+        return AnalysisPopup(
+            holder = holder,
+            container = container,
+            wordBody = wordBody,
+            wordList = wordList,
+            kanjiHeader = kanjiHeader,
+            kanjiBody = kanjiBody,
+            transHeader = transHeader,
+            transBody = transBody,
+            notesHeader = notesHeader,
+            notesBody = notesBody,
+            textMaxW = textMaxW,
+            reposition = { reposition() },
+        )
+    }
+
+    /** Sentence-mode popup backed by AWS Bedrock (MODE_SENTENCE_LLM). */
+    private fun showLlmAnalysisPopup(box: SentenceBox) {
+        val ui = buildAnalysisPopup(box) ?: return
+
         val token = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .getString(PREF_BEDROCK_TOKEN, "")
             .orEmpty()
             .trim()
 
         if (token.isEmpty()) {
-            wordBody.text = "(missing AWS_BEARER_TOKEN_BEDROCK — set it in the app)"
-            container.post { reposition() }
+            ui.wordBody.text = "(missing AWS_BEARER_TOKEN_BEDROCK — set it in the app)"
+            ui.container.post { ui.reposition() }
             return
         }
 
@@ -1495,30 +2004,121 @@ class OverlayService : Service() {
         Thread {
             val result = runCatching { BedrockClient.analyzeJapanese(sentence, token) }
             mainHandler.post {
-                if (popup !== holder) return@post
+                if (popup !== ui.holder) return@post
                 result.onSuccess { a ->
-                    wordBody.text = if (a.wordByWord.isNotBlank())
-                        renderInlineMarkdown(a.wordByWord) else "(no analysis)"
-                    if (a.phrases.isNotBlank()) {
-                        phraseBody.text = renderInlineMarkdown(a.phrases)
-                        phraseHeader.visibility = View.VISIBLE
-                        phraseBody.visibility = View.VISIBLE
+                    if (a.words.isNotEmpty()) {
+                        ui.wordBody.visibility = View.GONE
+                        ui.wordList.removeAllViews()
+                        for (w in a.words) {
+                            ui.wordList.addView(buildWordRow(w, ui.textMaxW, box.fullText, a.translation))
+                        }
+                        ui.wordList.visibility = View.VISIBLE
+                    } else {
+                        ui.wordBody.text = if (a.wordByWord.isNotBlank())
+                            renderInlineMarkdown(a.wordByWord) else "(no analysis)"
+                    }
+                    if (a.kanji.isNotBlank() && a.kanji.trim() != "(none)") {
+                        ui.kanjiBody.text = renderInlineMarkdown(a.kanji)
+                        ui.kanjiHeader.visibility = View.VISIBLE
+                        ui.kanjiBody.visibility = View.VISIBLE
                     }
                     if (a.translation.isNotBlank()) {
-                        transBody.text = renderInlineMarkdown(a.translation)
-                        transHeader.visibility = View.VISIBLE
-                        transBody.visibility = View.VISIBLE
+                        ui.transBody.text = renderInlineMarkdown(a.translation)
+                        ui.transHeader.visibility = View.VISIBLE
+                        ui.transBody.visibility = View.VISIBLE
                     }
                     if (a.notes.isNotBlank() && a.notes.trim() != "(none)") {
-                        notesBody.text = renderInlineMarkdown(a.notes)
-                        notesHeader.visibility = View.VISIBLE
-                        notesBody.visibility = View.VISIBLE
+                        ui.notesBody.text = renderInlineMarkdown(a.notes)
+                        ui.notesHeader.visibility = View.VISIBLE
+                        ui.notesBody.visibility = View.VISIBLE
                     }
                 }.onFailure { e ->
                     Log.e(TAG, "LLM analysis failed", e)
-                    wordBody.text = "Error: ${e.message ?: e.javaClass.simpleName}"
+                    ui.wordBody.text = "Error: ${e.message ?: e.javaClass.simpleName}"
                 }
-                container.post { reposition() }
+                ui.container.post { ui.reposition() }
+            }
+        }.start()
+    }
+
+    /**
+     * Offline sentence-mode popup (MODE_SENTENCE_DICT). Word-by-word comes from
+     * Kuromoji morphemes glossed against JMdict; the Kanji section from KANJIDIC2;
+     * the full-sentence translation from Google Translate. No LLM, so no Notes.
+     */
+    private fun showDictAnalysisPopup(box: SentenceBox) {
+        val ui = buildAnalysisPopup(box) ?: return
+        ui.wordBody.text = "Looking up…"
+
+        val sentence = box.fullText
+        Thread {
+            // No-op if handleStart already warmed it; guards against a tap that
+            // races the warm-up.
+            JmDict.warmUp(this)
+            val available = JmDict.isAvailable()
+
+            // Word-by-word: one row per distinct Kuromoji dictionary form, glossed
+            // against JMdict. Reading comes from Kuromoji (katakana → hiragana),
+            // matching morpheme mode.
+            val entries = ArrayList<BedrockClient.WordEntry>()
+            if (available) {
+                val seen = HashSet<String>()
+                val morphemes = runCatching { JapaneseTokenizer.extract(sentence) }
+                    .getOrDefault(emptyList())
+                for (m in morphemes) {
+                    if (!seen.add(m.base)) continue
+                    val reading = if (JapaneseTokenizer.containsKanji(m.base) && m.reading.isNotEmpty())
+                        JapaneseTokenizer.katakanaToHiragana(m.reading) else ""
+                    val gloss = JmDict.lookupWord(m.base)?.gloss ?: "(not in dictionary)"
+                    entries += BedrockClient.WordEntry(m.base, reading, gloss, "")
+                }
+            }
+
+            // Kanji section: each distinct kanji → KANJIDIC2 meaning + JLPT, in the
+            // same em-dash format the LLM kanji body uses.
+            val kanjiText = if (available) {
+                val sb = StringBuilder()
+                val seenK = HashSet<Char>()
+                for (c in sentence) {
+                    if (!JapaneseTokenizer.containsKanji(c.toString()) || !seenK.add(c)) continue
+                    val ki = JmDict.lookupKanji(c) ?: continue
+                    sb.append(c).append(" — ").append(ki.meaning)
+                    if (ki.jlpt.isNotEmpty()) sb.append("  [").append(ki.jlpt).append(']')
+                    sb.append('\n')
+                }
+                sb.toString().trim()
+            } else ""
+
+            val translation = runCatching { Translator.translateJaToEn(sentence) }.getOrDefault("")
+
+            mainHandler.post {
+                if (popup !== ui.holder) return@post
+                if (!available) {
+                    ui.wordBody.text =
+                        "Dictionary not built — run scripts/build_jmdict_db.py and reinstall."
+                } else if (entries.isNotEmpty()) {
+                    ui.wordBody.visibility = View.GONE
+                    ui.wordList.removeAllViews()
+                    for (w in entries) {
+                        ui.wordList.addView(
+                            buildWordRow(w, ui.textMaxW, sentence, translation, expandable = true)
+                        )
+                    }
+                    ui.wordList.visibility = View.VISIBLE
+                } else {
+                    ui.wordBody.text = "(no words found)"
+                }
+                if (kanjiText.isNotEmpty()) {
+                    ui.kanjiBody.text = kanjiText
+                    ui.kanjiHeader.visibility = View.VISIBLE
+                    ui.kanjiBody.visibility = View.VISIBLE
+                }
+                if (translation.isNotBlank()) {
+                    ui.transBody.text = translation
+                    ui.transHeader.visibility = View.VISIBLE
+                    ui.transBody.visibility = View.VISIBLE
+                }
+                ui.container.post { ui.reposition() }
             }
         }.start()
     }

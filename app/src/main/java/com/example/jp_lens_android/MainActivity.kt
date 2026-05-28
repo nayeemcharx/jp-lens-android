@@ -10,11 +10,13 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -38,13 +40,23 @@ import androidx.core.content.ContextCompat
 import com.example.jp_lens_android.ui.theme.JplensandroidTheme
 
 class MainActivity : ComponentActivity() {
+
+    companion object {
+        /** Set by [OverlayService] when the user taps "+" but AnkiDroid permission isn't granted. */
+        const val EXTRA_REQUEST_ANKI_PERMISSION = "request_anki_permission"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        val requestAnkiPerm = intent?.getBooleanExtra(EXTRA_REQUEST_ANKI_PERMISSION, false) ?: false
         setContent {
             JplensandroidTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    PermissionFlow(modifier = Modifier.padding(innerPadding))
+                    PermissionFlow(
+                        modifier = Modifier.padding(innerPadding),
+                        autoRequestAnkiPermission = requestAnkiPerm,
+                    )
                 }
             }
         }
@@ -52,9 +64,29 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun PermissionFlow(modifier: Modifier = Modifier) {
+fun PermissionFlow(
+    modifier: Modifier = Modifier,
+    autoRequestAnkiPermission: Boolean = false,
+) {
     val context = LocalContext.current
     var status by remember { mutableStateOf("Idle") }
+
+    val ankiPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        status = if (granted) "AnkiDroid permission granted — tap + again in the overlay."
+        else "AnkiDroid permission denied."
+        Toast.makeText(context, status, Toast.LENGTH_LONG).show()
+    }
+
+    LaunchedEffect(autoRequestAnkiPermission) {
+        if (autoRequestAnkiPermission &&
+            ContextCompat.checkSelfPermission(context, AnkiDroidHelper.PERMISSION) !=
+                PackageManager.PERMISSION_GRANTED
+        ) {
+            ankiPermLauncher.launch(AnkiDroidHelper.PERMISSION)
+        }
+    }
 
     val prefs = remember {
         context.getSharedPreferences(OverlayService.PREFS_NAME, Context.MODE_PRIVATE)
@@ -81,10 +113,14 @@ fun PermissionFlow(modifier: Modifier = Modifier) {
                 putExtra(OverlayService.EXTRA_MODE, pendingMode)
             }
             ContextCompat.startForegroundService(context, svc)
-            status = if (pendingMode == OverlayService.MODE_SENTENCE_LLM)
-                "Overlay running (LLM sentence mode) — switch apps and tap the floating button."
-            else
-                "Overlay running — switch to your game and tap the floating button."
+            status = when (pendingMode) {
+                OverlayService.MODE_SENTENCE_LLM ->
+                    "Overlay running (LLM sentence mode) — switch apps and tap the floating button."
+                OverlayService.MODE_SENTENCE_DICT ->
+                    "Overlay running (offline JMdict sentence mode) — switch apps and tap the floating button."
+                else ->
+                    "Overlay running — switch to your game and tap the floating button."
+            }
         } else {
             status = "Screen capture permission denied."
         }
@@ -152,12 +188,16 @@ fun PermissionFlow(modifier: Modifier = Modifier) {
             Text("3. LLM+full sentence block")
         }
 
+        Button(onClick = { launchCapture(OverlayService.MODE_SENTENCE_DICT) }) {
+            Text("4. Full sentence block + word-by-word (offline JMdict)")
+        }
+
         Button(onClick = {
             val svc = Intent(context, OverlayService::class.java).apply {
                 action = OverlayService.ACTION_STOP
             }
             context.startService(svc)
             status = "Stopped."
-        }) { Text("4. Stop") }
+        }) { Text("5. Stop") }
     }
 }

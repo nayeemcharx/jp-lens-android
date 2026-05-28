@@ -61,6 +61,7 @@ dependencies {
     implementation(libs.mlkit.text.recognition.japanese)
     implementation(libs.kotlinx.coroutines.play.services)
     implementation(libs.kuromoji.ipadic)
+    implementation(libs.anki.droid.api)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)

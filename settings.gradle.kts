@@ -19,6 +19,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // AnkiDroid AddContentApi is published on JitPack only.
+        maven { setUrl("https://jitpack.io") }
     }
 }
 
