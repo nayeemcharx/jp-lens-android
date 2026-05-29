@@ -1,7 +1,35 @@
 {
   "permissions": {
     "allow": [
-      "WebSearch"
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:sudachi.s3-website-ap-northeast-1.amazonaws.com)",
+      "Bash(python3 scripts/build_sudachi_dict.py)",
+      "Bash(curl -s https://api.github.com/repos/stephenmk/yomitan-jlpt-vocab/contents/__TRACKED_VAR__)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/stephenmk/yomitan-jlpt-vocab/main/original_data/n5.csv\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/stephenmk/yomitan-jlpt-vocab/main/original_data/n1.csv\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/stephenmk/yomitan-jlpt-vocab/main/README.md\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/stephenmk/yomitan-jlpt-vocab/main/LICENSE.txt\")",
+      "Bash(python3 -m py_compile scripts/build_jmdict_db.py)",
+      "Bash(sed -n '195,240p' scripts/build_jmdict_db.py)",
+      "Bash(python3 scripts/build_jmdict_db.py)",
+      "Bash(sqlite3 app/src/main/assets/jmdict.db \"SELECT key,jlpt,common,kana_pref FROM entries WHERE key IN \\('会う','食べる','水','たべる'\\) ORDER BY key;\")",
+      "Bash(sqlite3 app/src/main/assets/jmdict.db \"SELECT key,reading,substr\\(gloss,1,30\\),common,kana_pref FROM entries WHERE key='きれい' ORDER BY kana_pref DESC, common DESC;\")",
+      "Bash(sqlite3 app/src/main/assets/jmdict.db \"SELECT key,substr\\(gloss,1,40\\),common,kana_pref FROM entries WHERE key='こと' ORDER BY kana_pref DESC, common DESC LIMIT 3;\")",
+      "Bash(cd *)",
+      "Bash(python3 -c \"import genanki; print\\('genanki', genanki.__version__\\)\")",
+      "Bash(python3 -c \"import sqlite3,gzip,json; con=sqlite3.connect\\('app/src/main/assets/jmdict.db'\\); print\\('words with N3-5:', con.execute\\(\\\\\"SELECT COUNT\\(DISTINCT word_id\\) FROM entries WHERE jlpt IN \\('N3','N4','N5'\\)\\\\\"\\).fetchone\\(\\)[0]\\)\")",
+      "Bash(pip --version)",
+      "Bash(/tmp/jpvenv/bin/pip install *)",
+      "Bash(/tmp/jpvenv/bin/python -c \"import sudachipy, fugashi, ipadic; print\\('ok'\\)\")",
+      "Bash(/tmp/jpvenv/bin/python *)",
+      "Skill(claude-api)",
+      "Bash(python3 scripts/build_jmdict_db.py --shrink app/src/main/assets/jmdict.db)",
+      "Bash(python3 scripts/build_sudachi_dict.py --lite)",
+      "Bash(python3 -m py_compile scripts/build_jmdict_db.py scripts/build_sudachi_dict.py)",
+      "Bash(python3 -)",
+      "Bash(python3 -m pip --version)",
+      "Bash(python3 -m pip install --quiet --user sudachipy)"
     ]
   }
 }

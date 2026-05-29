@@ -1,50 +1,118 @@
 package com.example.jp_lens_android
 
-import com.atilika.kuromoji.ipadic.Token
-import com.atilika.kuromoji.ipadic.Tokenizer
+import android.content.Context
+import android.util.Log
+import com.worksap.nlp.sudachi.Config
+import com.worksap.nlp.sudachi.Dictionary
+import com.worksap.nlp.sudachi.DictionaryFactory
+import com.worksap.nlp.sudachi.Tokenizer as SudachiTokenizer
+import com.worksap.nlp.sudachi.Morpheme as SudachiMorpheme
+import java.io.File
+import java.nio.file.Paths
 
 /**
- * Thin wrapper around Kuromoji IPADIC.
+ * Thin wrapper around the Sudachi morphological analyzer (replacing Kuromoji IPADIC).
  *
- * Filter is a small blacklist of grammatical-glue POS — particles (の, を, が, に, は…),
- * auxiliary verbs (だ, です, ます, た, ない…), punctuation, fillers, and unclassified.
- * Everything else (nouns including pronouns and numerals, verbs, adjectives, adverbs,
- * conjunctions, interjections, prefixes, pre-noun adjectivals) is kept and returned
- * with its dictionary form.
+ * Sudachi offers three split granularities — A (shortest), B (middle), C (longest /
+ * named-entity). We segment morpheme boxes with [SudachiTokenizer.SplitMode.C] so each
+ * box is the *biggest meaningful unit* (e.g. 東京都, 関西国際空港 stay whole), and produce
+ * furigana with the finest mode A so every kana/particle gets its own reading.
+ *
+ * Filter is a small blacklist of grammatical-glue / symbol POS plus a "contains a
+ * Japanese character" gate, which together drop punctuation, whitespace and stray
+ * Latin/digits — keeping nouns, verbs, adjectives, adverbs, etc. with their dictionary
+ * form.
+ *
+ * Sudachi needs its system dictionary (`system_full.dic`) on the filesystem, so — like
+ * [JmDict] — [warmUp] copies `assets/system_full.dic` to internal storage on first use.
+ * That asset is NOT committed (~140 MB); build it once with
+ * `python3 scripts/build_sudachi_dict.py`. Until then [extract] returns nothing and
+ * morpheme mode shows no boxes (see CLAUDE.md).
  */
 object JapaneseTokenizer {
 
+    private const val TAG = "JpLens.Tokenizer"
+    private const val ASSET_NAME = "system_full.dic"
+    private const val DICT_NAME = "system_full.dic"
+    // Bump when a regenerated dictionary should replace an already-copied one across an
+    // in-place app update (a fresh install copies regardless).
+    // v2: switched the bundled dict to the SudachiDict *small* edition (~123 MB vs
+    // ~360 MB full) to keep the APK small — see scripts/build_sudachi_dict.py --lite.
+    private const val DICT_ASSET_VERSION = 2
+    private const val PREF_COPIED_VERSION = "sudachi_dict_copied_version"
+
     data class Morpheme(
         val surface: String,    // as it appeared in the text
-        val base: String,       // dictionary form
+        val base: String,       // normalized dictionary form (Sudachi normalizedForm)
         val pos: String,        // top-level part of speech (e.g. 名詞)
         val reading: String,    // katakana reading, or "" if unknown
         val start: Int,         // char offset in the input string
         val end: Int            // exclusive char offset
     )
 
-    private val tokenizer: Tokenizer by lazy { Tokenizer() }
+    @Volatile private var dictionary: Dictionary? = null
+    @Volatile private var tokenizer: SudachiTokenizer? = null
+    @Volatile private var triedOpen = false
 
-    private val dropPos = setOf("その他")
+    // POS level-1 categories that are never useful as their own box.
+    private val dropPos = setOf("補助記号", "空白", "記号", "その他")
 
-    fun warmUp() {
-        // Force dictionary load off the hot path.
-        tokenizer.tokenize("起動")
+    /** True once the dictionary asset has been copied and opened successfully. */
+    fun isAvailable(): Boolean = tokenizer != null
+
+    /**
+     * Copy (if needed) + open the Sudachi system dictionary. Idempotent; safe to call
+     * repeatedly. Call off the main thread — the first call copies a ~140 MB asset.
+     */
+    @Synchronized
+    fun warmUp(context: Context) {
+        if (tokenizer != null || triedOpen) return
+        triedOpen = true
+        try {
+            val dic = ensureCopied(context)
+            val config = Config.defaultConfig().systemDictionary(Paths.get(dic.absolutePath))
+            val dict = DictionaryFactory().create(config)
+            dictionary = dict
+            tokenizer = dict.create()
+            // Force the lattice/plugins to initialize off the hot path.
+            tokenizer?.tokenize(SudachiTokenizer.SplitMode.C, "起動")
+            Log.i(TAG, "opened ${dic.absolutePath}")
+        } catch (t: Throwable) {
+            Log.e(TAG, "Sudachi unavailable — run scripts/build_sudachi_dict.py to create assets/$ASSET_NAME", t)
+            tokenizer = null
+            dictionary = null
+        }
+    }
+
+    private fun ensureCopied(context: Context): File {
+        val target = File(context.filesDir, DICT_NAME)
+        val prefs = context.getSharedPreferences(OverlayService.PREFS_NAME, Context.MODE_PRIVATE)
+        val copiedVersion = prefs.getInt(PREF_COPIED_VERSION, -1)
+        if (target.exists() && copiedVersion == DICT_ASSET_VERSION) return target
+
+        context.assets.open(ASSET_NAME).use { input ->
+            target.outputStream().use { output -> input.copyTo(output, 64 * 1024) }
+        }
+        prefs.edit().putInt(PREF_COPIED_VERSION, DICT_ASSET_VERSION).apply()
+        Log.i(TAG, "copied asset $ASSET_NAME -> ${target.absolutePath} (${target.length()} bytes)")
+        return target
     }
 
     fun extract(text: String): List<Morpheme> {
         if (text.isBlank()) return emptyList()
-        return tokenizer.tokenize(text)
+        val tk = tokenizer ?: return emptyList()
+        return tk.tokenize(SudachiTokenizer.SplitMode.C, text)
             .filter { keep(it) }
             .map { it.toMorpheme() }
     }
 
-    private fun keep(t: Token): Boolean {
-        if (t.partOfSpeechLevel1 in dropPos) return false
+    private fun keep(m: SudachiMorpheme): Boolean {
+        if (m.partOfSpeech().firstOrNull() in dropPos) return false
+        val surface = m.surface()
         // Skip lone ASCII (spaces, punctuation that slip through, single Latin letters).
-        if (t.surface.length == 1 && t.surface[0].code < 0x80) return false
+        if (surface.length == 1 && surface[0].code < 0x80) return false
         // Drop tokens that contain no Japanese characters at all (pure digits / latin / etc.).
-        if (!containsJapanese(t.surface)) return false
+        if (!containsJapanese(surface)) return false
         return true
     }
 
@@ -72,16 +140,17 @@ object JapaneseTokenizer {
     }
 
     /**
-     * Re-tokenizes [text] without filtering and concatenates each token's reading
-     * (converted to hiragana). Used for the range popup, where we want a full
+     * Re-tokenizes [text] with the finest split (mode A) and concatenates each token's
+     * reading (converted to hiragana). Used for the range popup, where we want a full
      * furigana-like rendering including particles and auxiliaries.
      */
     fun fullReadingHiragana(text: String): String {
         if (text.isBlank()) return ""
+        val tk = tokenizer ?: return text
         val sb = StringBuilder()
-        for (t in tokenizer.tokenize(text)) {
-            val r = t.reading
-            if (r.isNullOrEmpty() || r == "*") sb.append(t.surface)
+        for (m in tk.tokenize(SudachiTokenizer.SplitMode.A, text)) {
+            val r = m.readingForm()
+            if (r.isNullOrEmpty()) sb.append(m.surface())
             else sb.append(katakanaToHiragana(r))
         }
         return sb.toString()
@@ -98,16 +167,24 @@ object JapaneseTokenizer {
         return sb.toString()
     }
 
-    private fun Token.toMorpheme(): Morpheme {
-        val base = if (baseForm.isNullOrEmpty() || baseForm == "*") surface else baseForm
-        val rd = if (reading.isNullOrEmpty() || reading == "*") "" else reading
+    private fun SudachiMorpheme.toMorpheme(): Morpheme {
+        // normalizedForm() canonicalizes orthographic variants (附属→付属, ヴァイオリン→
+        // バイオリン, kana/okurigana variants), which raises the JMdict hit rate vs the
+        // plain dictionaryForm(). Fall back to dictionary form then surface if empty.
+        val norm = normalizedForm()
+        val base = when {
+            !norm.isNullOrEmpty() -> norm
+            !dictionaryForm().isNullOrEmpty() -> dictionaryForm()
+            else -> surface()
+        }
+        val rd = readingForm() ?: ""
         return Morpheme(
-            surface = surface,
+            surface = surface(),
             base = base,
-            pos = partOfSpeechLevel1,
+            pos = partOfSpeech().firstOrNull() ?: "",
             reading = rd,
-            start = position,
-            end = position + surface.length
+            start = begin(),
+            end = end()
         )
     }
 }

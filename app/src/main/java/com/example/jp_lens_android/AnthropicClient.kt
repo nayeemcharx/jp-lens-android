@@ -8,17 +8,19 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * Minimal AWS Bedrock Converse client authenticated with a long-lived
- * AWS_BEARER_TOKEN_BEDROCK (no SigV4 signing required).
+ * Minimal Anthropic Messages API client, authenticated with a long-lived
+ * `x-api-key` (no SigV4 / bearer signing). Talks directly to
+ * api.anthropic.com — no AWS Bedrock in between.
  */
-object BedrockClient {
+object AnthropicClient {
 
-    private const val TAG = "JpLens.Bedrock"
-    private const val REGION = "us-east-1"
-    // OpenAI gpt-oss-120b on Bedrock. Reasoning effort is forced to "low"
-    // below via additionalModelRequestFields so we get a quick direct answer
-    // instead of long chain-of-thought tokens.
-    private const val MODEL_ID = "openai.gpt-oss-120b-1:0"
+    private const val TAG = "JpLens.Anthropic"
+    private const val ENDPOINT = "https://api.anthropic.com/v1/messages"
+    private const val API_VERSION = "2023-06-01"
+    // Claude Haiku 4.5 — fastest/cheapest model, good fit for a quick
+    // structured tutor-style breakdown. No effort/thinking knobs (Haiku
+    // doesn't support the effort parameter).
+    private const val MODEL_ID = "claude-haiku-4-5"
 
     private const val CACHE_CAP = 20
 
@@ -48,9 +50,9 @@ object BedrockClient {
 
     /** Blocking; call off the main thread. */
     @Throws(IOException::class)
-    fun analyzeJapanese(sentence: String, bearerToken: String): Analysis {
+    fun analyzeJapanese(sentence: String, apiKey: String): Analysis {
         require(sentence.isNotBlank()) { "sentence is blank" }
-        require(bearerToken.isNotBlank()) { "missing AWS_BEARER_TOKEN_BEDROCK" }
+        require(apiKey.isNotBlank()) { "missing Anthropic API key" }
 
         val cacheKey = sentence.trim()
         synchronized(cache) {
@@ -62,35 +64,29 @@ object BedrockClient {
 
         val prompt = buildPrompt(sentence)
         val body = JSONObject().apply {
+            put("model", MODEL_ID)
+            put("max_tokens", 2048)
             put("messages", JSONArray().put(
                 JSONObject().apply {
                     put("role", "user")
-                    put("content", JSONArray().put(JSONObject().put("text", prompt)))
+                    put("content", JSONArray().put(
+                        JSONObject().apply {
+                            put("type", "text")
+                            put("text", prompt)
+                        }
+                    ))
                 }
             ))
-            put("inferenceConfig", JSONObject().apply {
-                // gpt-oss is designed for temperature=1.0; lower values can
-                // degrade quality. maxTokens budget covers both the hidden
-                // reasoning channel and the visible answer.
-                put("maxTokens", 3000)
-                put("temperature", 1.0)
-            })
-            // gpt-oss accepts a reasoning_effort knob; "low" keeps the model
-            // from spending most of its tokens on hidden chain-of-thought.
-            put("additionalModelRequestFields", JSONObject().apply {
-                put("reasoning_effort", "low")
-            })
         }.toString()
 
-        // Path-safe encoding: colon in model id stays as-is (RFC 3986 sub-delim ok in path).
-        val url = URL("https://bedrock-runtime.$REGION.amazonaws.com/model/$MODEL_ID/converse")
-        val conn = url.openConnection() as HttpURLConnection
+        val conn = URL(ENDPOINT).openConnection() as HttpURLConnection
         try {
             conn.requestMethod = "POST"
             conn.connectTimeout = 10_000
             conn.readTimeout = 60_000
             conn.doOutput = true
-            conn.setRequestProperty("Authorization", "Bearer $bearerToken")
+            conn.setRequestProperty("x-api-key", apiKey)
+            conn.setRequestProperty("anthropic-version", API_VERSION)
             conn.setRequestProperty("Content-Type", "application/json")
             conn.setRequestProperty("Accept", "application/json")
             conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
@@ -100,7 +96,7 @@ object BedrockClient {
             val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
             if (code !in 200..299) {
                 Log.e(TAG, "HTTP $code: ${text.take(400)}")
-                throw IOException("Bedrock HTTP $code: ${text.take(200)}")
+                throw IOException("Anthropic HTTP $code: ${text.take(200)}")
             }
             val raw = extractAssistantText(text)
             val analysis = parseSections(raw)
@@ -149,15 +145,15 @@ If nothing notable, write exactly: (none)
 Sentence: $sentence
 """.trimIndent()
 
-    /** Pulls concatenated assistant text out of a Converse response, skipping reasoning blocks. */
+    /** Pulls concatenated assistant text out of a Messages API response. */
     private fun extractAssistantText(body: String): String {
         return try {
             val root = JSONObject(body)
-            val msg = root.optJSONObject("output")?.optJSONObject("message") ?: return ""
-            val content = msg.optJSONArray("content") ?: return ""
+            val content = root.optJSONArray("content") ?: return ""
             val sb = StringBuilder()
             for (i in 0 until content.length()) {
                 val block = content.optJSONObject(i) ?: continue
+                if (block.optString("type") != "text") continue
                 val t = block.optString("text", "")
                 if (t.isNotEmpty()) sb.append(t)
             }

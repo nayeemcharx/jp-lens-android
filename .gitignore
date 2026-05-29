@@ -16,3 +16,9 @@ local.properties
 
 # Generated offline dictionary (built by scripts/build_jmdict_db.py); too large to commit.
 /app/src/main/assets/jmdict.db
+
+# Sudachi system dictionary (fetched by scripts/build_sudachi_dict.py); ~140 MB, not committed.
+/app/src/main/assets/system_full.dic
+
+# Generated Anki decks (built by scripts/build_anki_apkg.py).
+/*.apkg

@@ -18,7 +18,11 @@ import java.util.zip.GZIPInputStream
  * script has been run once. See CLAUDE.md.
  *
  * Schema (see the build script):
- *   entries(key TEXT, reading TEXT, gloss TEXT, common INTEGER)   -- indexed on key
+ *   entries(key, reading, gloss, common, word_id, jlpt, kana_pref)  -- indexed on key
+ *       jlpt: word-level JLPT (N5..N1); kana_pref: 1 when key is kana AND the word
+ *       is kana-native, so a kana surface prefers the kana word over kanji homographs
+ *   detail(word_id PRIMARY KEY, json BLOB)   -- gzipped trimmed JSON per word
+ *   tags(code TEXT PRIMARY KEY, label TEXT)
  *   kanji(literal TEXT PRIMARY KEY, meanings TEXT, jlpt TEXT)
  *   meta(version TEXT)
  *
@@ -33,7 +37,11 @@ object JmDict {
     // Bump this whenever a regenerated jmdict.db should replace an already-copied
     // one across an in-place app update (a fresh install copies regardless).
     // v2 added the detail/tags tables + entries.word_id for the expandable word view.
-    private const val DB_ASSET_VERSION = 2
+    // v3 added entries.jlpt (word-level JLPT) + entries.kana_pref (kana-native rank)
+    //    and per-writing/reading "j" JLPT tags in the detail blob.
+    // v4: shipped the *lite* db (common/JLPT words only, ~11 MB vs ~102 MB) to keep
+    //    the APK small — same schema; see scripts/build_jmdict_db.py --lite / --shrink.
+    private const val DB_ASSET_VERSION = 4
     private const val PREF_COPIED_VERSION = "jmdict_db_copied_version"
 
     @Volatile private var db: SQLiteDatabase? = null
@@ -41,21 +49,23 @@ object JmDict {
     // code -> human label (e.g. "v1" -> "Ichidan verb"); loaded once in warmUp.
     @Volatile private var tags: Map<String, String> = emptyMap()
 
-    data class WordInfo(val gloss: String)
+    data class WordInfo(val gloss: String, val jlpt: String)
     data class KanjiInfo(val meaning: String, val jlpt: String)
 
-    /** Full JMdict entry for the expandable word panel. */
+    /** Full JMdict entry for the expandable word panel. [jlpt] is word-level. */
     data class WordDetail(
         val writings: List<Writing>,
         val readings: List<Reading>,
         val senses: List<Sense>,
+        val jlpt: String,
     )
-    data class Writing(val text: String, val common: Boolean, val tags: List<String>)
+    data class Writing(val text: String, val common: Boolean, val tags: List<String>, val jlpt: String)
     data class Reading(
         val text: String,
         val common: Boolean,
         val tags: List<String>,
         val appliesToKanji: List<String>,
+        val jlpt: String,
     )
     data class Sense(
         val partOfSpeech: List<String>,
@@ -110,15 +120,19 @@ object JmDict {
         return target
     }
 
-    /** Best entry for a Kuromoji dictionary-form word, preferring "common" entries. */
+    /**
+     * Best entry for a tokenizer dictionary-form word. For a kana surface, prefers a
+     * kana-native word (kana_pref) over a kanji homograph that merely shares the
+     * reading; then prefers "common" entries.
+     */
     fun lookupWord(base: String): WordInfo? {
         val d = db ?: return null
         if (base.isBlank()) return null
         return d.rawQuery(
-            "SELECT gloss FROM entries WHERE key = ? ORDER BY common DESC LIMIT 1",
+            "SELECT gloss, jlpt FROM entries WHERE key = ? ORDER BY kana_pref DESC, common DESC LIMIT 1",
             arrayOf(base)
         ).use { c ->
-            if (c.moveToFirst()) WordInfo(c.getString(0)) else null
+            if (c.moveToFirst()) WordInfo(c.getString(0), c.getString(1) ?: "") else null
         }
     }
 
@@ -138,16 +152,18 @@ object JmDict {
 
     /**
      * Every full JMdict entry whose kanji/kana headword equals [base] (homographs
-     * included), common entries first. Each blob is gzip-compressed JSON; decompress,
-     * parse and map. Returns empty when [base] isn't in JMdict or the DB is missing.
+     * included). For a kana [base], kana-native words come first (kana_pref), then
+     * common entries. Each blob is gzip-compressed JSON; decompress, parse and map.
+     * Returns empty when [base] isn't in JMdict or the DB is missing.
      */
     fun lookupWordDetail(base: String): List<WordDetail> {
         val d = db ?: return emptyList()
         if (base.isBlank()) return emptyList()
         val out = ArrayList<WordDetail>()
         d.rawQuery(
-            "SELECT DISTINCT d.json FROM entries e JOIN detail d ON e.word_id = d.word_id " +
-                "WHERE e.key = ? ORDER BY e.common DESC",
+            "SELECT DISTINCT d.json, e.kana_pref, e.common FROM entries e " +
+                "JOIN detail d ON e.word_id = d.word_id " +
+                "WHERE e.key = ? ORDER BY e.kana_pref DESC, e.common DESC",
             arrayOf(base)
         ).use { c ->
             while (c.moveToNext()) {
@@ -176,12 +192,12 @@ object JmDict {
     private fun parseDetail(json: String): WordDetail {
         val o = JSONObject(json)
         val writings = o.optJSONArray("k").mapObjects { obj ->
-            Writing(obj.optString("t"), obj.optInt("c") == 1, obj.strList("tags"))
+            Writing(obj.optString("t"), obj.optInt("c") == 1, obj.strList("tags"), obj.optString("j"))
         }
         val readings = o.optJSONArray("r").mapObjects { obj ->
             Reading(
                 obj.optString("t"), obj.optInt("c") == 1,
-                obj.strList("tags"), obj.strList("ak")
+                obj.strList("tags"), obj.strList("ak"), obj.optString("j")
             )
         }
         val senses = o.optJSONArray("s").mapObjects { obj ->
@@ -204,7 +220,7 @@ object JmDict {
                 glosses = obj.strList("g"),
             )
         }
-        return WordDetail(writings, readings, senses)
+        return WordDetail(writings, readings, senses, o.optString("j"))
     }
 
     private inline fun <T> JSONArray?.mapObjects(f: (JSONObject) -> T): List<T> {

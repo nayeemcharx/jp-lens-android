@@ -92,7 +92,7 @@ fun PermissionFlow(
         context.getSharedPreferences(OverlayService.PREFS_NAME, Context.MODE_PRIVATE)
     }
     var apiKey by remember {
-        mutableStateOf(prefs.getString(OverlayService.PREF_BEDROCK_TOKEN, "") ?: "")
+        mutableStateOf(prefs.getString(OverlayService.PREF_ANTHROPIC_KEY, "") ?: "")
     }
 
     val projectionManager = remember {
@@ -162,9 +162,9 @@ fun PermissionFlow(
             value = apiKey,
             onValueChange = {
                 apiKey = it
-                prefs.edit().putString(OverlayService.PREF_BEDROCK_TOKEN, it).apply()
+                prefs.edit().putString(OverlayService.PREF_ANTHROPIC_KEY, it).apply()
             },
-            label = { Text("AWS_BEARER_TOKEN_BEDROCK") },
+            label = { Text("Anthropic API key") },
             singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
             modifier = Modifier.fillMaxWidth(),

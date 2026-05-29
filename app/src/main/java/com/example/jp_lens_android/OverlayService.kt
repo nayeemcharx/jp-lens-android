@@ -31,6 +31,7 @@ import android.os.IBinder
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
@@ -46,7 +47,9 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
@@ -66,7 +69,7 @@ class OverlayService : Service() {
         const val MODE_SENTENCE_DICT = 2
 
         const val PREFS_NAME = "jp_lens"
-        const val PREF_BEDROCK_TOKEN = "aws_bearer_token_bedrock"
+        const val PREF_ANTHROPIC_KEY = "anthropic_api_key"
         // Last capture mode chosen (start button resumes it; radial menu updates it).
         const val PREF_LAST_MODE = "last_mode"
 
@@ -81,8 +84,15 @@ class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
     private var floatingView: View? = null
-    // Full-screen radial mode-switch menu (long-press the floating button).
+    // Half-circle radial mode-switch menu (hold the floating button, then drag
+    // toward an option and release). The menu window is passive (NOT_TOUCHABLE);
+    // the floating button's own touch gesture drives hover + selection.
     private var radialMenu: View? = null
+    private var radialOptions: List<RadialOption> = emptyList()
+    private var radialCenterX = 0   // floating-button center, in screen px
+    private var radialCenterY = 0
+    private var radialActivation = 0 // dead-zone radius around center (release here = cancel)
+    private var radialSelected = -1  // index into radialOptions, or -1 for none
 
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
@@ -192,14 +202,16 @@ class OverlayService : Service() {
         captureThread = HandlerThread("JpLensCapture").also { it.start() }
         captureHandler = Handler(captureThread!!.looper)
 
-        // Warm the Kuromoji dictionary off the main thread so the first OCR tap is snappy.
+        // Warm the Sudachi dictionary off the main thread so the first OCR tap is snappy.
         captureHandler?.post {
             val t0 = System.currentTimeMillis()
-            JapaneseTokenizer.warmUp()
-            Log.i(TAG, "Kuromoji warm-up: ${System.currentTimeMillis() - t0} ms")
+            JapaneseTokenizer.warmUp(this)
+            Log.i(TAG, "Sudachi warm-up: ${System.currentTimeMillis() - t0} ms (available=${JapaneseTokenizer.isAvailable()})")
         }
-        // Dict mode also copies + opens the offline JMdict SQLite asset up front.
-        if (mode == MODE_SENTENCE_DICT) {
+        // Dict mode and OCR/morpheme mode both use the offline JMdict SQLite
+        // asset (dict mode for word-by-word; OCR mode for the single-tap detail
+        // popup), so copy + open it up front for either.
+        if (mode == MODE_SENTENCE_DICT || mode == MODE_MORPHEME) {
             captureHandler?.post {
                 val t0 = System.currentTimeMillis()
                 JmDict.warmUp(this)
@@ -264,7 +276,8 @@ class OverlayService : Service() {
             dp(64), dp(64),
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -309,15 +322,20 @@ class OverlayService : Service() {
         var touchStartX = 0f
         var touchStartY = 0f
         var moved = false
-        var longPressFired = false
+        var menuOpen = false
+        var v0: View? = null  // the touched view, captured for haptics in [longPress]
         val touchSlop = dp(8)
-        // Holding the button (without dragging) opens the radial mode menu.
+        // Holding the button (without first dragging) opens the half-circle menu.
+        // From then on the *same* gesture drives hover-selection — release over an
+        // option to pick it, release in the center dead-zone to cancel.
         val longPress = Runnable {
-            longPressFired = true
+            menuOpen = true
+            v0?.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
             showRadialMenu(params)
         }
 
         view.setOnTouchListener { v, event ->
+            v0 = v
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
                     initialX = params.x
@@ -325,12 +343,15 @@ class OverlayService : Service() {
                     touchStartX = event.rawX
                     touchStartY = event.rawY
                     moved = false
-                    longPressFired = false
+                    menuOpen = false
                     mainHandler.postDelayed(longPress, MENU_HOLD_MS)
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    if (abs(event.rawX - touchStartX) > touchSlop ||
+                    if (menuOpen) {
+                        // Gesture now steers the menu, not the button.
+                        updateRadialSelection(event.rawX, event.rawY)
+                    } else if (abs(event.rawX - touchStartX) > touchSlop ||
                         abs(event.rawY - touchStartY) > touchSlop
                     ) {
                         moved = true
@@ -343,8 +364,18 @@ class OverlayService : Service() {
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     mainHandler.removeCallbacks(longPress)
-                    // Plain tap (no drag, no menu) = capture/clear.
-                    if (!moved && !longPressFired) v.performClick()
+                    if (menuOpen) {
+                        // Commit the highlighted option (if any) and tear the menu down.
+                        val sel = radialSelected
+                        val opts = radialOptions
+                        dismissRadialMenu()
+                        if (event.action == MotionEvent.ACTION_UP && sel in opts.indices)
+                            opts[sel].action()
+                    } else if (!moved) {
+                        // Plain tap (no drag, no menu) = capture/clear.
+                        v.performClick()
+                    }
+                    menuOpen = false
                     true
                 }
                 else -> false
@@ -369,7 +400,9 @@ class OverlayService : Service() {
         clearSentenceBoxes()
         mode = newMode
         persistMode()
-        if (newMode == MODE_SENTENCE_DICT) captureHandler?.post { JmDict.warmUp(this) }
+        // Both dict mode and OCR/morpheme mode look words up in JMdict.
+        if (newMode == MODE_SENTENCE_DICT || newMode == MODE_MORPHEME)
+            captureHandler?.post { JmDict.warmUp(this) }
         updateOcrButtonAppearance()
         val name = when (newMode) {
             MODE_SENTENCE_LLM -> "LLM sentence"
@@ -381,10 +414,21 @@ class OverlayService : Service() {
 
     private data class MenuOption(val label: String, val color: Int, val action: () -> Unit)
 
+    /** A placed half-circle option: its view, fan angle, and tint, for hover styling. */
+    private data class RadialOption(
+        val view: TextView,
+        val color: Int,
+        val angleRad: Double,
+        val action: () -> Unit,
+    )
+
     /**
-     * Radial mode-switch menu shown on long-press of the floating button. Option
-     * buttons (the three modes + Stop) are arranged in a circle around the button;
-     * tapping the dimmed background dismisses it.
+     * Half-circle mode-switch menu shown after holding the floating button. The
+     * options (three modes + Stop) fan out on a semicircle **away from the screen
+     * edge** — button on the left → options open to the right, and vice-versa, so
+     * they never run off-screen. The window itself is passive (`NOT_TOUCHABLE`);
+     * the same finger-down that opened it keeps steering [updateRadialSelection],
+     * and releasing commits the highlighted option (see [attachDragAndClick]).
      */
     private fun showRadialMenu(btnParams: WindowManager.LayoutParams) {
         if (radialMenu != null) return
@@ -396,37 +440,47 @@ class OverlayService : Service() {
         val screenH = metrics.heightPixels
 
         val options = listOf(
-            MenuOption("OCR", Color.argb(230, 30, 100, 220)) { setMode(MODE_MORPHEME) },
-            MenuOption("LLM", Color.argb(230, 140, 60, 200)) { setMode(MODE_SENTENCE_LLM) },
-            MenuOption("辞書", Color.argb(230, 40, 160, 120)) { setMode(MODE_SENTENCE_DICT) },
-            MenuOption("Stop", Color.argb(230, 220, 80, 60)) { stopSelf() },
+            MenuOption("OCR", Color.argb(235, 30, 100, 220)) { setMode(MODE_MORPHEME) },
+            MenuOption("LLM", Color.argb(235, 140, 60, 200)) { setMode(MODE_SENTENCE_LLM) },
+            MenuOption("辞書", Color.argb(235, 40, 160, 120)) { setMode(MODE_SENTENCE_DICT) },
+            MenuOption("Stop", Color.argb(235, 220, 80, 60)) { stopSelf() },
         )
 
         val scrim = FrameLayout(this).apply {
-            setBackgroundColor(Color.argb(120, 0, 0, 0))
-            isClickable = true
-            setOnClickListener { dismissRadialMenu() }
+            setBackgroundColor(Color.argb(110, 0, 0, 0))
         }
 
-        val radius = dp(104)
-        val size = dp(58)
+        // Semicircle opening away from the nearer horizontal edge.
+        val faceRight = cx < screenW / 2
+        val centerDeg = if (faceRight) 0.0 else 180.0
+        val halfSweepDeg = 80.0   // 160° total spread
+        val n = options.size
+        val startDeg = centerDeg - halfSweepDeg
+        val stepDeg = if (n > 1) (2 * halfSweepDeg) / (n - 1) else 0.0
+
+        val radius = dp(120)
+        val size = dp(56)
         val margin = dp(6)
+        val placed = ArrayList<RadialOption>(n)
         for ((i, opt) in options.withIndex()) {
-            // Start at the top, go clockwise.
-            val angle = (2.0 * PI * i / options.size) - PI / 2.0
+            val angle = Math.toRadians(startDeg + i * stepDeg)
             val ox = cx + (radius * cos(angle)).toInt()
             val oy = cy + (radius * sin(angle)).toInt()
-            val lx = (ox - size / 2).coerceIn(margin, screenW - margin - size)
-            val ly = (oy - size / 2).coerceIn(margin, screenH - margin - size)
-            val btn = makeOptionButton(opt.label, opt.color) {
-                dismissRadialMenu()
-                opt.action()
+            val view = TextView(this).apply {
+                text = opt.label
+                setTextColor(Color.WHITE)
+                textSize = 14f
+                gravity = Gravity.CENTER
+                background = optionDrawable(opt.color, selected = false)
+                elevation = dp(4).toFloat()
+                alpha = 0.9f
             }
-            scrim.addView(btn, FrameLayout.LayoutParams(size, size).apply {
+            scrim.addView(view, FrameLayout.LayoutParams(size, size).apply {
                 gravity = Gravity.TOP or Gravity.START
-                leftMargin = lx
-                topMargin = ly
+                leftMargin = (ox - size / 2).coerceIn(margin, screenW - margin - size)
+                topMargin = (oy - size / 2).coerceIn(margin, screenH - margin - size)
             })
+            placed += RadialOption(view, opt.color, angle, opt.action)
         }
 
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
@@ -437,40 +491,78 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             type,
-            // NO_LIMITS so the scrim shares the floating button's full-screen
-            // coordinate space (incl. the status-bar region); otherwise the option
-            // buttons would be offset by the top inset.
+            // NOT_TOUCHABLE — the floating button owns the gesture and drives
+            // selection; the menu is purely visual. NO_LIMITS so it shares the
+            // button's full-screen coordinate space (incl. the status-bar region),
+            // otherwise the options would be offset by the top inset.
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START }
 
         try {
             windowManager.addView(scrim, params)
             radialMenu = scrim
+            radialOptions = placed
+            radialCenterX = cx
+            radialCenterY = cy
+            radialActivation = dp(36)
+            radialSelected = -1
         } catch (e: Exception) {
             Log.e(TAG, "Failed to add radial menu", e)
         }
     }
 
-    private fun makeOptionButton(label: String, color: Int, onClick: () -> Unit): TextView =
-        TextView(this).apply {
-            text = label
-            setTextColor(Color.WHITE)
-            textSize = 14f
-            gravity = Gravity.CENTER
-            isClickable = true
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(color)
-            }
-            elevation = dp(4).toFloat()
-            setOnClickListener { onClick() }
+    /** Oval option background; gains a white ring when it's the hovered option. */
+    private fun optionDrawable(color: Int, selected: Boolean): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(color)
+            if (selected) setStroke(dp(3), Color.WHITE)
         }
+
+    /**
+     * Hover-select while the menu is open: pick the option whose fan direction is
+     * closest to the finger (so you only have to point roughly toward it), unless
+     * the finger is still inside the center dead-zone (→ no selection / cancel).
+     */
+    private fun updateRadialSelection(rawX: Float, rawY: Float) {
+        val opts = radialOptions
+        if (opts.isEmpty()) return
+        val dx = (rawX - radialCenterX).toDouble()
+        val dy = (rawY - radialCenterY).toDouble()
+        val sel = if (hypot(dx, dy) < radialActivation) {
+            -1
+        } else {
+            val touchAngle = atan2(dy, dx)
+            var best = -1
+            var bestDiff = Double.MAX_VALUE
+            for ((i, o) in opts.withIndex()) {
+                var d = abs(touchAngle - o.angleRad)
+                if (d > PI) d = 2 * PI - d  // shortest angular distance
+                if (d < bestDiff) { bestDiff = d; best = i }
+            }
+            best
+        }
+        if (sel == radialSelected) return
+        radialSelected = sel
+        for ((i, o) in opts.withIndex()) {
+            val on = i == sel
+            o.view.background = optionDrawable(o.color, on)
+            o.view.alpha = if (on) 1f else 0.9f
+            o.view.animate().scaleX(if (on) 1.2f else 1f).scaleY(if (on) 1.2f else 1f)
+                .setDuration(90).start()
+        }
+        if (sel >= 0) opts[sel].view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+    }
 
     private fun dismissRadialMenu() {
         radialMenu?.let { runCatching { windowManager.removeView(it) } }
         radialMenu = null
+        radialOptions = emptyList()
+        radialSelected = -1
     }
 
     private fun captureAndRecognize() {
@@ -828,7 +920,8 @@ class OverlayService : Service() {
                 b.width, b.height + padY * 2,
                 type,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
@@ -877,7 +970,7 @@ class OverlayService : Service() {
             val m = b.morpheme
             val rd = if (m.reading.isNotEmpty()) "  [${m.reading}]" else ""
             Log.i(TAG, "tap → ${m.base}  (${m.pos}, surface=${m.surface})$rd")
-            showTranslationPopup(b)
+            showWordDetailPopup(b)
         }
     }
 
@@ -913,29 +1006,34 @@ class OverlayService : Service() {
         }
     }
 
-    private fun showTranslationPopup(box: MorphemeBox) {
+    /**
+     * Single-tap popup for one morpheme box (OCR/morpheme mode): the full
+     * offline JMdict entry for the tapped word — all senses, tags, alternate
+     * forms, plus a Kanji subsection — reusing [renderWordDetail] (the same
+     * detail panel dict mode expands inline). A range selection instead runs
+     * Google Translate (see [showRangePopup]).
+     */
+    private fun showWordDetailPopup(box: MorphemeBox) {
         dismissPopup()
         val m = box.morpheme
         val hasKanji = JapaneseTokenizer.containsKanji(m.base)
         val hira = if (hasKanji && m.reading.isNotEmpty())
             JapaneseTokenizer.katakanaToHiragana(m.reading) else ""
+        val titleStr = if (hira.isNotEmpty()) "${m.base}  $hira" else m.base
 
-        val titleStr = if (hira.isNotEmpty()) "${m.base}  ${hira}" else m.base
+        val metrics = resources.displayMetrics
+        val screenW = metrics.widthPixels
+        val screenH = metrics.heightPixels
+        val margin = dp(6)
+        val maxPopupW = min(dp(340), screenW - 2 * margin)
+        val maxScrollH = (screenH * 0.55f).toInt()
+        val textMaxW = maxPopupW - dp(28)
+
         val titleView = TextView(this).apply {
             text = titleStr
             setTextColor(Color.WHITE)
             textSize = 16f
             setPadding(0, 0, 0, dp(2))
-        }
-        val translationView = TextView(this).apply {
-            text = "Translating…"
-            setTextColor(Color.argb(255, 210, 210, 210))
-            textSize = 14f
-        }
-        val textCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(titleView)
-            addView(translationView)
         }
         val closeBtn = TextView(this).apply {
             text = "✕"
@@ -945,40 +1043,89 @@ class OverlayService : Service() {
             isClickable = true
             setOnClickListener { dismissPopup() }
         }
-        val container = LinearLayout(this).apply {
+        val headerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            addView(titleView, LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(closeBtn, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
+
+        val bodyCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(TextView(this@OverlayService).apply {
+                text = "Looking up…"
+                setTextColor(Color.argb(255, 210, 210, 210))
+                textSize = 14f
+            })
+        }
+        // ScrollView capped at maxScrollH; wraps to content below the cap.
+        val scroll = object : android.widget.ScrollView(this) {
+            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                val capped = View.MeasureSpec.makeMeasureSpec(maxScrollH, View.MeasureSpec.AT_MOST)
+                super.onMeasure(widthMeasureSpec, capped)
+            }
+        }.apply {
+            isVerticalScrollBarEnabled = true
+            addView(bodyCol, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
-                setColor(Color.argb(235, 0, 0, 0))
+                setColor(Color.argb(238, 0, 0, 0))
                 cornerRadius = dp(8).toFloat()
             }
             setPadding(dp(12), dp(8), dp(8), dp(8))
-            addView(textCol, LinearLayout.LayoutParams(
+            addView(headerRow, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(scroll, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-            addView(closeBtn, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
+                LinearLayout.LayoutParams.WRAP_CONTENT))
         }
 
-        // Measure to compute placement.
-        val unspec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
-        container.measure(unspec, unspec)
-        val pw = container.measuredWidth
-        val ph = container.measuredHeight
+        // Re-clamp on-screen position whenever content changes size (the detail
+        // arrives async and the popup grows downward).
+        fun reposition() {
+            val wSpec = View.MeasureSpec.makeMeasureSpec(maxPopupW, View.MeasureSpec.AT_MOST)
+            val hSpec = View.MeasureSpec.makeMeasureSpec(screenH, View.MeasureSpec.AT_MOST)
+            container.measure(wSpec, hSpec)
+            val pw = min(container.measuredWidth, maxPopupW)
+            val ph = container.measuredHeight
+            val centerX = box.left + box.width / 2
+            var x = centerX - pw / 2
+            if (x < margin) x = margin
+            if (x + pw > screenW - margin) x = screenW - margin - pw
+            var y = box.top - ph - dp(6)
+            if (y < margin) y = box.top + box.height + dp(6)
+            if (y + ph > screenH - margin) y = screenH - margin - ph
+            if (y < margin) y = margin
+            val lp = container.layoutParams as? WindowManager.LayoutParams ?: return
+            if (lp.x != x || lp.y != y) {
+                lp.x = x
+                lp.y = y
+                runCatching { windowManager.updateViewLayout(container, lp) }
+            }
+        }
 
-        val metrics = resources.displayMetrics
-        val screenW = metrics.widthPixels
-        val centerX = box.left + box.width / 2
-        var x = centerX - pw / 2
-        var y = box.top - ph - dp(6)
-        // Clamp horizontally.
-        val margin = dp(4)
-        if (x < margin) x = margin
-        if (x + pw > screenW - margin) x = screenW - margin - pw
-        // If the popup would be off the top of the screen, place it below the box.
-        if (y < margin) y = box.top + box.height + dp(6)
+        // Initial measure for first placement.
+        val wSpec = View.MeasureSpec.makeMeasureSpec(maxPopupW, View.MeasureSpec.AT_MOST)
+        val hSpec = View.MeasureSpec.makeMeasureSpec(screenH, View.MeasureSpec.AT_MOST)
+        container.measure(wSpec, hSpec)
+        val pw0 = min(container.measuredWidth, maxPopupW)
+        val ph0 = container.measuredHeight
+        val centerX0 = box.left + box.width / 2
+        var x0 = centerX0 - pw0 / 2
+        if (x0 < margin) x0 = margin
+        if (x0 + pw0 > screenW - margin) x0 = screenW - margin - pw0
+        var y0 = box.top - ph0 - dp(6)
+        if (y0 < margin) y0 = box.top + box.height + dp(6)
+        if (y0 + ph0 > screenH - margin) y0 = screenH - margin - ph0
+        if (y0 < margin) y0 = margin
 
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -990,37 +1137,48 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.WRAP_CONTENT,
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            this.x = x
-            this.y = y
+            this.x = x0
+            this.y = y0
         }
 
         try {
             windowManager.addView(container, params)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to add popup", e)
+            Log.e(TAG, "Failed to add detail popup", e)
             return
         }
 
-        val holder = PopupHolder(container, translationView)
+        val holder = PopupHolder(container, titleView)
         popup = holder
 
-        // Translate off the main thread.
-        val query = m.base
+        // Look the word up off the main thread.
         Thread {
-            val result = try {
-                Translator.translateJaToEn(query)
-            } catch (e: Throwable) {
-                Log.e(TAG, "Translation failed for '$query'", e)
-                ""
-            }
+            JmDict.warmUp(this)
+            val available = JmDict.isAvailable()
+            val details = if (available) JmDict.lookupWordDetail(m.base) else emptyList()
+            val kanji = if (available) kanjiInfoForWord(m.base) else emptyList()
             mainHandler.post {
-                if (popup === holder) {
-                    translationView.text = if (result.isBlank()) "(no translation)" else result
+                if (popup !== holder) return@post
+                bodyCol.removeAllViews()
+                when {
+                    !available -> bodyCol.addView(TextView(this@OverlayService).apply {
+                        text = "Dictionary not built"
+                        setTextColor(Color.argb(255, 160, 160, 160))
+                        textSize = 13f
+                    })
+                    details.isEmpty() && kanji.isEmpty() -> bodyCol.addView(TextView(this@OverlayService).apply {
+                        text = "(no dictionary entry)"
+                        setTextColor(Color.argb(255, 160, 160, 160))
+                        textSize = 13f
+                    })
+                    else -> bodyCol.addView(renderWordDetail(details, kanji, textMaxW))
                 }
+                container.post { reposition() }
             }
         }.start()
     }
@@ -1138,7 +1296,8 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.WRAP_CONTENT,
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -1185,7 +1344,7 @@ class OverlayService : Service() {
      * "+" button on the right that adds the word to AnkiDroid as a card.
      */
     private fun buildWordRow(
-        entry: BedrockClient.WordEntry,
+        entry: AnthropicClient.WordEntry,
         textMaxW: Int,
         sentence: String,
         translation: String,
@@ -1400,6 +1559,7 @@ class OverlayService : Service() {
                     sb.append("\n")
                     sb.styled("  " + w.text, cBody)
                     if (w.common) sb.styled("  ●", cPos, 0.8f)
+                    if (w.jlpt.isNotEmpty()) sb.styled("  [${w.jlpt}]", cPos, 0.8f, bold = true)
                     for (t in w.tags) sb.styled("  " + JmDict.tagLabel(t), cDim, 0.8f, italic = true)
                 }
                 col.addView(detailLine(sb, labelW))
@@ -1413,6 +1573,7 @@ class OverlayService : Service() {
                     sb.append("\n")
                     sb.styled("  " + r.text, cBody)
                     if (r.common) sb.styled("  ●", cPos, 0.8f)
+                    if (r.jlpt.isNotEmpty()) sb.styled("  [${r.jlpt}]", cPos, 0.8f, bold = true)
                     for (t in r.tags) sb.styled("  " + JmDict.tagLabel(t), cDim, 0.8f, italic = true)
                     val ak = r.appliesToKanji.filter { it != "*" }
                     if (ak.isNotEmpty())
@@ -1533,7 +1694,7 @@ class OverlayService : Service() {
 
     /** LLM-mode add: front = word, back = the summary (reading/meaning/JLPT/sentence). */
     private fun handleAddToAnki(
-        entry: BedrockClient.WordEntry,
+        entry: AnthropicClient.WordEntry,
         btn: TextView,
         sentence: String,
         translation: String,
@@ -1555,7 +1716,7 @@ class OverlayService : Service() {
      * JMdict detail blob rendered as HTML (all senses, POS, tags, xrefs, loanword, …).
      */
     private fun handleAddToAnkiDict(
-        entry: BedrockClient.WordEntry,
+        entry: AnthropicClient.WordEntry,
         btn: TextView,
         sentence: String,
         translation: String,
@@ -1582,7 +1743,7 @@ class OverlayService : Service() {
      * translation. Colors are chosen to read on Anki's default white background.
      */
     private fun buildAnkiBackHtml(
-        entry: BedrockClient.WordEntry,
+        entry: AnthropicClient.WordEntry,
         details: List<JmDict.WordDetail>,
         kanji: List<Pair<Char, JmDict.KanjiInfo>>,
         sentence: String,
@@ -1607,6 +1768,9 @@ class OverlayService : Service() {
                     for (w in wd.writings) {
                         sb.append("<div>").append(htmlEscape(w.text))
                         if (w.common) sb.append(" <span style=\"color:$pos\">●</span>")
+                        if (w.jlpt.isNotEmpty())
+                            sb.append(" <span style=\"color:$pos;font-weight:bold\">[")
+                                .append(htmlEscape(w.jlpt)).append("]</span>")
                         for (t in w.tags)
                             sb.append(" <span style=\"color:$dim;font-style:italic\">")
                                 .append(htmlEscape(JmDict.tagLabel(t))).append("</span>")
@@ -1618,6 +1782,9 @@ class OverlayService : Service() {
                     for (r in wd.readings) {
                         sb.append("<div>").append(htmlEscape(r.text))
                         if (r.common) sb.append(" <span style=\"color:$pos\">●</span>")
+                        if (r.jlpt.isNotEmpty())
+                            sb.append(" <span style=\"color:$pos;font-weight:bold\">[")
+                                .append(htmlEscape(r.jlpt)).append("]</span>")
                         for (t in r.tags)
                             sb.append(" <span style=\"color:$dim;font-style:italic\">")
                                 .append(htmlEscape(JmDict.tagLabel(t))).append("</span>")
@@ -1879,7 +2046,8 @@ class OverlayService : Service() {
                 b.width, b.height + padY * 2,
                 type,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
@@ -2147,7 +2315,8 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.WRAP_CONTENT,
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -2209,24 +2378,24 @@ class OverlayService : Service() {
         )
     }
 
-    /** Sentence-mode popup backed by AWS Bedrock (MODE_SENTENCE_LLM). */
+    /** Sentence-mode popup backed by the Anthropic API (MODE_SENTENCE_LLM). */
     private fun showLlmAnalysisPopup(box: SentenceBox) {
         val ui = buildAnalysisPopup(box) ?: return
 
-        val token = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getString(PREF_BEDROCK_TOKEN, "")
+        val apiKey = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(PREF_ANTHROPIC_KEY, "")
             .orEmpty()
             .trim()
 
-        if (token.isEmpty()) {
-            ui.wordBody.text = "(missing AWS_BEARER_TOKEN_BEDROCK — set it in the app)"
+        if (apiKey.isEmpty()) {
+            ui.wordBody.text = "(missing Anthropic API key — set it in the app)"
             ui.container.post { ui.reposition() }
             return
         }
 
         val sentence = box.fullText
         Thread {
-            val result = runCatching { BedrockClient.analyzeJapanese(sentence, token) }
+            val result = runCatching { AnthropicClient.analyzeJapanese(sentence, apiKey) }
             mainHandler.post {
                 if (popup !== ui.holder) return@post
                 result.onSuccess { a ->
@@ -2284,7 +2453,7 @@ class OverlayService : Service() {
             // Word-by-word: one row per distinct Kuromoji dictionary form, glossed
             // against JMdict. Reading comes from Kuromoji (katakana → hiragana),
             // matching morpheme mode.
-            val entries = ArrayList<BedrockClient.WordEntry>()
+            val entries = ArrayList<AnthropicClient.WordEntry>()
             if (available) {
                 val seen = HashSet<String>()
                 val morphemes = runCatching { JapaneseTokenizer.extract(sentence) }
@@ -2293,8 +2462,9 @@ class OverlayService : Service() {
                     if (!seen.add(m.base)) continue
                     val reading = if (JapaneseTokenizer.containsKanji(m.base) && m.reading.isNotEmpty())
                         JapaneseTokenizer.katakanaToHiragana(m.reading) else ""
-                    val gloss = JmDict.lookupWord(m.base)?.gloss ?: "(not in dictionary)"
-                    entries += BedrockClient.WordEntry(m.base, reading, gloss, "")
+                    val info = JmDict.lookupWord(m.base)
+                    val gloss = info?.gloss ?: "(not in dictionary)"
+                    entries += AnthropicClient.WordEntry(m.base, reading, gloss, info?.jlpt ?: "")
                 }
             }
 
