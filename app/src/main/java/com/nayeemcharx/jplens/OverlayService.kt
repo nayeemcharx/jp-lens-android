@@ -1,4 +1,4 @@
-package com.example.jp_lens_android
+package com.nayeemcharx.jplens
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -58,8 +58,8 @@ class OverlayService : Service() {
 
     companion object {
         const val TAG = "JpLens"
-        const val ACTION_START = "com.example.jp_lens_android.START"
-        const val ACTION_STOP = "com.example.jp_lens_android.STOP"
+        const val ACTION_START = "com.nayeemcharx.jplens.START"
+        const val ACTION_STOP = "com.nayeemcharx.jplens.STOP"
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
         const val EXTRA_MODE = "mode"
@@ -70,6 +70,8 @@ class OverlayService : Service() {
 
         const val PREFS_NAME = "jp_lens"
         const val PREF_ANTHROPIC_KEY = "anthropic_api_key"
+        // AnkiDroid deck name the "+" button adds cards to (set on the home screen).
+        const val PREF_ANKI_DECK = "anki_deck_name"
         // Last capture mode chosen (start button resumes it; radial menu updates it).
         const val PREF_LAST_MODE = "last_mode"
 
@@ -178,6 +180,8 @@ class OverlayService : Service() {
         startForegroundCompat()
 
         mode = intent.getIntExtra(EXTRA_MODE, MODE_MORPHEME)
+        // Don't resume LLM mode when no Anthropic key is configured.
+        if (mode == MODE_SENTENCE_LLM && !isAnthropicConfigured()) mode = MODE_MORPHEME
         persistMode()
         Log.i(TAG, "Starting mode=$mode (0=morpheme, 1=sentence+LLM, 2=sentence+JMdict)")
 
@@ -295,8 +299,8 @@ class OverlayService : Service() {
         btn.text = when {
             active -> "✕"
             mode == MODE_SENTENCE_LLM -> "LLM"
-            mode == MODE_SENTENCE_DICT -> "辞書"
-            else -> "OCR"
+            mode == MODE_SENTENCE_DICT -> "文"
+            else -> "言葉"
         }
         btn.background = GradientDrawable().apply {
             if (active) {
@@ -389,6 +393,11 @@ class OverlayService : Service() {
             .putInt(PREF_LAST_MODE, mode).apply()
     }
 
+    /** LLM mode is offered (radial menu) only when an Anthropic API key is set. */
+    private fun isAnthropicConfigured(): Boolean =
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(PREF_ANTHROPIC_KEY, "").orEmpty().isNotBlank()
+
     /**
      * Switches capture mode live without reopening the app. The MediaProjection is
      * already granted, so this just swaps the `mode` field, drops stale overlays, and
@@ -439,12 +448,14 @@ class OverlayService : Service() {
         val screenW = metrics.widthPixels
         val screenH = metrics.heightPixels
 
-        val options = listOf(
-            MenuOption("OCR", Color.argb(235, 30, 100, 220)) { setMode(MODE_MORPHEME) },
-            MenuOption("LLM", Color.argb(235, 140, 60, 200)) { setMode(MODE_SENTENCE_LLM) },
-            MenuOption("辞書", Color.argb(235, 40, 160, 120)) { setMode(MODE_SENTENCE_DICT) },
-            MenuOption("Stop", Color.argb(235, 220, 80, 60)) { stopSelf() },
-        )
+        val options = buildList {
+            add(MenuOption("言葉", Color.argb(235, 30, 100, 220)) { setMode(MODE_MORPHEME) })
+            // LLM only appears when an Anthropic key is configured (home screen).
+            if (isAnthropicConfigured())
+                add(MenuOption("LLM", Color.argb(235, 140, 60, 200)) { setMode(MODE_SENTENCE_LLM) })
+            add(MenuOption("文", Color.argb(235, 40, 160, 120)) { setMode(MODE_SENTENCE_DICT) })
+            add(MenuOption("Stop", Color.argb(235, 220, 80, 60)) { stopSelf() })
+        }
 
         val scrim = FrameLayout(this).apply {
             setBackgroundColor(Color.argb(110, 0, 0, 0))
@@ -1365,40 +1376,45 @@ class OverlayService : Service() {
             append(" — ").append(entry.meaning)
             if (entry.jlpt.isNotEmpty()) append("  [").append(entry.jlpt).append(']')
         }
-        val addBtn = TextView(this).apply {
-            text = "+"
-            setTextColor(Color.argb(255, 200, 240, 200))
-            textSize = 18f
-            setTypeface(typeface, Typeface.BOLD)
-            setPadding(dp(10), dp(2), dp(10), dp(2))
-            isClickable = true
-            background = GradientDrawable().apply {
-                setColor(Color.argb(60, 200, 240, 200))
-                cornerRadius = dp(6).toFloat()
-            }
-            contentDescription = "Add to AnkiDroid"
-        }
-        // Reserve width for the leading "+" (and trailing chevron, if expandable)
-        // so long text still wraps inside the popup.
+        // The "+" Add-to-Anki button only appears when AnkiDroid is installed, its API
+        // permission is granted, and a deck name is set (configured on the home screen).
+        val showAnki = AnkiDroidHelper.isConfigured(this)
+        // Reserve width for the leading "+" (only when shown) and trailing chevron.
         val label = TextView(this).apply {
             text = labelText
             setTextColor(Color.argb(255, 230, 230, 230))
             textSize = 13f
-            maxWidth = textMaxW - dp(44) - if (expandable) dp(34) else 0
+            maxWidth = textMaxW - (if (showAnki) dp(44) else 0) - if (expandable) dp(34) else 0
         }
-        addBtn.setOnClickListener {
-            // Dict mode (expandable): card back = the full JMdict detail blob.
-            // LLM mode: card back = the summary (reading/meaning/JLPT/sentence).
-            if (expandable) handleAddToAnkiDict(entry, addBtn, sentence, translation)
-            else handleAddToAnki(entry, addBtn, sentence, translation)
-        }
+        val addBtn: TextView? = if (showAnki) {
+            val b = TextView(this).apply {
+                text = "+"
+                setTextColor(Color.argb(255, 200, 240, 200))
+                textSize = 18f
+                setTypeface(typeface, Typeface.BOLD)
+                setPadding(dp(10), dp(2), dp(10), dp(2))
+                isClickable = true
+                background = GradientDrawable().apply {
+                    setColor(Color.argb(60, 200, 240, 200))
+                    cornerRadius = dp(6).toFloat()
+                }
+                contentDescription = "Add to AnkiDroid"
+            }
+            b.setOnClickListener {
+                // Dict mode (expandable): card back = the full JMdict detail blob.
+                // LLM mode: card back = the summary (reading/meaning/JLPT/sentence).
+                if (expandable) handleAddToAnkiDict(entry, b, sentence, translation)
+                else handleAddToAnki(entry, b, sentence, translation)
+            }
+            b
+        } else null
         // "+" sits at the left, immediately before the word, so it stays close
         // to the word regardless of how wide the popup gets.
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(2), 0, dp(2))
-            addView(addBtn, LinearLayout.LayoutParams(
+            if (addBtn != null) addView(addBtn, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { rightMargin = dp(8) })
@@ -2267,6 +2283,14 @@ class OverlayService : Service() {
             ))
         }
 
+        // A small white grab bar centered at the top to signal the popup is draggable.
+        // It (and the header row) move the popup — see the touch listener below.
+        val dragHandle = View(this).apply {
+            background = GradientDrawable().apply {
+                cornerRadius = dp(2).toFloat()
+                setColor(Color.argb(150, 255, 255, 255))
+            }
+        }
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
@@ -2274,6 +2298,10 @@ class OverlayService : Service() {
                 cornerRadius = dp(8).toFloat()
             }
             setPadding(dp(12), dp(8), dp(8), dp(8))
+            addView(dragHandle, LinearLayout.LayoutParams(dp(40), dp(5)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                bottomMargin = dp(6)
+            })
             // MATCH_PARENT here so the header row stretches to the popup's
             // natural width (determined by the scroll content), letting the
             // title's weight=1 push the ✕ to the right edge.
@@ -2366,7 +2394,7 @@ class OverlayService : Service() {
         var dragInitialY = 0
         var dragStartRawX = 0f
         var dragStartRawY = 0f
-        headerRow.setOnTouchListener { _, event ->
+        val dragListener = View.OnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
                     dragInitialX = params.x
@@ -2385,6 +2413,8 @@ class OverlayService : Service() {
                 else -> false
             }
         }
+        headerRow.setOnTouchListener(dragListener)
+        dragHandle.setOnTouchListener(dragListener)
 
         return AnalysisPopup(
             holder = holder,

@@ -1,4 +1,4 @@
-package com.example.jp_lens_android
+package com.nayeemcharx.jplens
 
 import android.content.Context
 import android.content.pm.PackageManager
@@ -20,7 +20,7 @@ object AnkiDroidHelper {
     const val PERMISSION = "com.ichi2.anki.permission.READ_WRITE_DATABASE"
 
     private const val TAG = "JpLens.Anki"
-    private const val DECK_NAME = "JP Lens"
+    private const val DEFAULT_DECK_NAME = "JP Lens"
     private const val MODEL_NAME = "JP Lens Basic"
     private val MODEL_FIELDS = arrayOf("Front", "Back")
     private val CARD_NAMES = arrayOf("Card 1")
@@ -34,6 +34,18 @@ object AnkiDroidHelper {
     fun hasPermission(context: Context): Boolean =
         ContextCompat.checkSelfPermission(context, PERMISSION) ==
             PackageManager.PERMISSION_GRANTED
+
+    /** The configured deck name (set on the home screen), trimmed; "" when unset. */
+    fun configuredDeckName(context: Context): String =
+        context.getSharedPreferences(OverlayService.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(OverlayService.PREF_ANKI_DECK, DEFAULT_DECK_NAME).orEmpty().trim()
+
+    /**
+     * True when AnkiDroid is installed, its API permission is granted, and a deck name
+     * is set — i.e. the overlay's "+" Add-to-Anki button should be shown.
+     */
+    fun isConfigured(context: Context): Boolean =
+        isAnkiInstalled(context) && hasPermission(context) && configuredDeckName(context).isNotEmpty()
 
     /** Result of an add attempt — distinguishes "already there" from a real failure. */
     sealed class AddResult {
@@ -63,8 +75,9 @@ object AnkiDroidHelper {
         if (!hasPermission(context)) return AddResult.Failed("AnkiDroid permission not granted")
         return try {
             val api = AddContentApi(context)
-            val deckId = findDeckId(api, DECK_NAME) ?: api.addNewDeck(DECK_NAME)
-                ?: return AddResult.Failed("Failed to create deck \"$DECK_NAME\"")
+            val deck = configuredDeckName(context).ifEmpty { DEFAULT_DECK_NAME }
+            val deckId = findDeckId(api, deck) ?: api.addNewDeck(deck)
+                ?: return AddResult.Failed("Failed to create deck \"$deck\"")
             val modelId = findModelId(api, MODEL_NAME)
                 ?: api.addNewCustomModel(MODEL_NAME, MODEL_FIELDS, CARD_NAMES, QFMT, AFMT, null, deckId, null)
                 ?: return AddResult.Failed("Failed to create model \"$MODEL_NAME\"")

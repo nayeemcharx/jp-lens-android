@@ -1,4 +1,4 @@
-package com.example.jp_lens_android
+package com.nayeemcharx.jplens
 
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase

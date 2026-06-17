@@ -30,7 +30,8 @@
       "Bash(python3 -)",
       "Bash(python3 -m pip --version)",
       "Bash(python3 -m pip install --quiet --user sudachipy)",
-      "Bash(git ls-tree *)"
+      "Bash(git ls-tree *)",
+      "Bash(grep *)"
     ]
   }
 }

@@ -1,4 +1,4 @@
-package com.example.jp_lens_android
+package com.nayeemcharx.jplens
 
 import android.util.Log
 import com.google.android.gms.tasks.Tasks

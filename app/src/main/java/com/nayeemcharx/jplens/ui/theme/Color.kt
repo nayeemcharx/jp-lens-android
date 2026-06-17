@@ -1,4 +1,4 @@
-package com.example.jp_lens_android.ui.theme
+package com.nayeemcharx.jplens.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
