@@ -29,7 +29,8 @@
       "Bash(python3 -m py_compile scripts/build_jmdict_db.py scripts/build_sudachi_dict.py)",
       "Bash(python3 -)",
       "Bash(python3 -m pip --version)",
-      "Bash(python3 -m pip install --quiet --user sudachipy)"
+      "Bash(python3 -m pip install --quiet --user sudachipy)",
+      "Bash(git ls-tree *)"
     ]
   }
 }

@@ -13,10 +13,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.jp_lens_android"
-        // Sudachi (JapaneseTokenizer) loads its dictionary via java.nio.file, which
-        // only exists on Android API 26+. Don't lower this without a ByteBuffer/desugar
-        // dict-load path.
-        minSdk = 26
+        minSdk = 24
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
@@ -42,7 +39,7 @@ android {
     }
     packaging {
         resources {
-            // Several deps ship colliding META-INF docs.
+            // Kuromoji's ipadic + core JARs both ship META-INF/CONTRIBUTORS.md.
             excludes += setOf(
                 "META-INF/CONTRIBUTORS.md",
                 "META-INF/LICENSE.md",
@@ -62,8 +59,9 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.mlkit.text.recognition.japanese)
+    implementation(libs.mlkit.translate)
     implementation(libs.kotlinx.coroutines.play.services)
-    implementation(libs.sudachi)
+    implementation(libs.kuromoji.ipadic)
     implementation(libs.anki.droid.api)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))

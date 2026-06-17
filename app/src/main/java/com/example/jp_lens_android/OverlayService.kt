@@ -1318,15 +1318,19 @@ class OverlayService : Service() {
         Log.i(TAG, "range = \"$rangeText\"   hira = \"$readingHira\"")
 
         Thread {
-            val result = try {
+            // Only show a translation when the offline model is downloaded (see the
+            // home screen's "Download translation model" button); otherwise omit it.
+            val ready = Translator.isDownloaded()
+            val result = if (ready) try {
                 Translator.translateJaToEn(rangeText)
             } catch (e: Throwable) {
                 Log.e(TAG, "Range translation failed", e)
                 ""
-            }
+            } else ""
             mainHandler.post {
                 if (popup === holder) {
-                    translationView.text = if (result.isBlank()) "(no translation)" else result
+                    if (!ready) translationView.visibility = View.GONE
+                    else translationView.text = if (result.isBlank()) "(no translation)" else result
                 }
             }
         }.start()
@@ -1350,9 +1354,12 @@ class OverlayService : Service() {
         translation: String,
         expandable: Boolean = false,
     ): View {
+        // Show the surface (the text as it appears in the sentence) when we have it;
+        // LLM-mode entries leave surface empty and fall back to the word form.
+        val display = entry.surface.ifEmpty { entry.word }
         val labelText = buildString {
-            append(entry.word)
-            if (entry.reading.isNotEmpty() && entry.reading != entry.word) {
+            append(display)
+            if (entry.reading.isNotEmpty() && entry.reading != display) {
                 append(" (").append(entry.reading).append(')')
             }
             append(" — ").append(entry.meaning)
@@ -2099,6 +2106,8 @@ class OverlayService : Service() {
         val container: View,
         val wordBody: TextView,
         val wordList: LinearLayout,
+        val readingHeader: TextView,
+        val readingBody: TextView,
         val kanjiHeader: TextView,
         val kanjiBody: TextView,
         val transHeader: TextView,
@@ -2176,6 +2185,19 @@ class OverlayService : Service() {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
         }
+        val readingHeader = TextView(this).apply {
+            text = "Reading"
+            setTextColor(Color.argb(255, 180, 220, 255))
+            textSize = 12f
+            setPadding(0, dp(6), 0, dp(2))
+            visibility = View.GONE
+        }
+        val readingBody = TextView(this).apply {
+            setTextColor(Color.argb(255, 230, 230, 230))
+            textSize = 14f
+            maxWidth = textMaxW
+            visibility = View.GONE
+        }
         val kanjiHeader = TextView(this).apply {
             text = "Kanji"
             setTextColor(Color.argb(255, 180, 220, 255))
@@ -2221,6 +2243,8 @@ class OverlayService : Service() {
             addView(wordHeader)
             addView(wordBody)
             addView(wordList)
+            addView(readingHeader)
+            addView(readingBody)
             addView(kanjiHeader)
             addView(kanjiBody)
             addView(transHeader)
@@ -2367,6 +2391,8 @@ class OverlayService : Service() {
             container = container,
             wordBody = wordBody,
             wordList = wordList,
+            readingHeader = readingHeader,
+            readingBody = readingBody,
             kanjiHeader = kanjiHeader,
             kanjiBody = kanjiBody,
             transHeader = transHeader,
@@ -2450,23 +2476,45 @@ class OverlayService : Service() {
             JmDict.warmUp(this)
             val available = JmDict.isAvailable()
 
-            // Word-by-word: one row per distinct Kuromoji dictionary form, glossed
-            // against JMdict. Reading comes from Kuromoji (katakana → hiragana),
-            // matching morpheme mode.
+            // Word-by-word: one row per morpheme, in the exact order they appear in
+            // the sentence (no dedup — the list mirrors the sentence). Each row's
+            // *label* is the morpheme's surface (the text actually shown), not
+            // Sudachi's normalized form, which can canonicalize a kana word into a
+            // rarely-used kanji. The gloss/detail/Anki still key off a dictionary
+            // lookup form (see lookupKey below).
             val entries = ArrayList<AnthropicClient.WordEntry>()
             if (available) {
-                val seen = HashSet<String>()
                 val morphemes = runCatching { JapaneseTokenizer.extract(sentence) }
                     .getOrDefault(emptyList())
                 for (m in morphemes) {
-                    if (!seen.add(m.base)) continue
-                    val reading = if (JapaneseTokenizer.containsKanji(m.base) && m.reading.isNotEmpty())
+                    val surface = m.surface
+                    // Lookup key: an all-kana surface means the writer chose kana on
+                    // purpose, so look the word up by its kana form — that lets
+                    // JMdict's kana_pref ranking surface the kana-native entry (and its
+                    // reading-only / rarely-used-kanji writings) instead of a kanji
+                    // homograph. Words written with kanji look up by the dictionary form.
+                    val lookupKey = if (!JapaneseTokenizer.containsKanji(surface)) {
+                        when {
+                            m.base.isNotEmpty() && !JapaneseTokenizer.containsKanji(m.base) -> m.base
+                            m.reading.isNotEmpty() -> JapaneseTokenizer.katakanaToHiragana(m.reading)
+                            else -> surface
+                        }
+                    } else m.base
+                    // Furigana column: only when the displayed surface carries kanji.
+                    val reading = if (JapaneseTokenizer.containsKanji(surface) && m.reading.isNotEmpty())
                         JapaneseTokenizer.katakanaToHiragana(m.reading) else ""
-                    val info = JmDict.lookupWord(m.base)
+                    val info = JmDict.lookupWord(lookupKey)
                     val gloss = info?.gloss ?: "(not in dictionary)"
-                    entries += AnthropicClient.WordEntry(m.base, reading, gloss, info?.jlpt ?: "")
+                    entries += AnthropicClient.WordEntry(
+                        lookupKey, reading, gloss, info?.jlpt ?: "", surface = surface
+                    )
                 }
             }
+
+            // Full kana reading of the whole sentence (mode-A re-tokenization, so
+            // particles/auxiliaries get readings too), built from Sudachi.
+            val reading = runCatching { JapaneseTokenizer.fullReadingHiragana(sentence) }
+                .getOrDefault("")
 
             // No standalone Kanji section in dict mode — each word's own kanji are
             // folded into that word's expandable detail panel (see buildWordRow).
@@ -2488,6 +2536,11 @@ class OverlayService : Service() {
                     ui.wordList.visibility = View.VISIBLE
                 } else {
                     ui.wordBody.text = "(no words found)"
+                }
+                if (reading.isNotBlank() && reading != sentence) {
+                    ui.readingBody.text = reading
+                    ui.readingHeader.visibility = View.VISIBLE
+                    ui.readingBody.visibility = View.VISIBLE
                 }
                 if (translation.isNotBlank()) {
                     ui.transBody.text = translation

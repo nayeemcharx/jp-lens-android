@@ -30,6 +30,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -38,6 +39,9 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.jp_lens_android.ui.theme.JplensandroidTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
@@ -70,6 +74,14 @@ fun PermissionFlow(
 ) {
     val context = LocalContext.current
     var status by remember { mutableStateOf("Idle") }
+
+    // Translation-model state: checking | absent | downloading | ready | failed.
+    val scope = rememberCoroutineScope()
+    var modelState by remember { mutableStateOf("checking") }
+    LaunchedEffect(Unit) {
+        val ok = withContext(Dispatchers.IO) { Translator.isDownloaded() }
+        modelState = if (ok) "ready" else "absent"
+    }
 
     val ankiPermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -169,6 +181,38 @@ fun PermissionFlow(
             visualTransformation = PasswordVisualTransformation(),
             modifier = Modifier.fillMaxWidth(),
         )
+
+        // Offline translation model: download once (over the network) from here. Until
+        // it's present the overlay omits translations; after, translation works offline.
+        if (modelState == "ready") {
+            Text("Translation model: downloaded ✓ (offline)")
+        } else {
+            Button(
+                onClick = {
+                    modelState = "downloading"
+                    scope.launch {
+                        val ok = withContext(Dispatchers.IO) { Translator.downloadModel() }
+                        modelState = if (ok) "ready" else "failed"
+                        Toast.makeText(
+                            context,
+                            if (ok) "Translation model downloaded — translation is now on."
+                            else "Download failed — check your connection and retry.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                },
+                enabled = modelState == "absent" || modelState == "failed",
+            ) {
+                Text(
+                    when (modelState) {
+                        "checking" -> "Checking translation model…"
+                        "downloading" -> "Downloading translation model…"
+                        "failed" -> "Download failed — retry"
+                        else -> "Download translation model"
+                    }
+                )
+            }
+        }
 
         Button(onClick = { startCapture() }) { Text("Start") }
 

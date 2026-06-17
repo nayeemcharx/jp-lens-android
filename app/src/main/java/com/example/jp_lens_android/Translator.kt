@@ -1,64 +1,91 @@
 package com.example.jp_lens_android
 
 import android.util.Log
-import org.json.JSONArray
-import java.io.IOException
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.common.model.RemoteModelManager
+import com.google.mlkit.nl.translate.TranslateLanguage
+import com.google.mlkit.nl.translate.TranslateRemoteModel
+import com.google.mlkit.nl.translate.Translation
+import com.google.mlkit.nl.translate.TranslatorOptions
+import com.google.mlkit.nl.translate.Translator as MlKitTranslator
 
 /**
- * Thin wrapper around Google Translate's unofficial public endpoint.
+ * On-device Japanese→English translation via Google ML Kit's Translation API.
  *
- * It's an unauthenticated endpoint that has been used by mobile/web tools for years.
- * Not an official Google product API — it can be rate-limited if hit aggressively,
- * but word-level lookups are fine.
+ * ML Kit translation models are download-only (they can't be bundled into the APK), so the
+ * JA + EN models are fetched once via [downloadModel] — triggered explicitly from the home
+ * screen, not silently on first use. Until they're present [translateJaToEn] returns "" and
+ * the overlay simply omits the translation; once downloaded it works fully offline.
+ *
+ * All three calls block on ML Kit Tasks, so they MUST be invoked off the main thread.
  */
 object Translator {
 
     private const val TAG = "JpLens.Translator"
 
-    /** Blocking call. MUST be invoked off the main thread. */
-    @Throws(IOException::class)
-    fun translateJaToEn(text: String): String {
-        if (text.isBlank()) return ""
-        val encoded = URLEncoder.encode(text, "UTF-8")
-        val url = URL(
-            "https://translate.googleapis.com/translate_a/single" +
-                "?client=gtx&sl=ja&tl=en&dt=t&q=$encoded"
+    private val translator: MlKitTranslator by lazy {
+        Translation.getClient(
+            TranslatorOptions.Builder()
+                .setSourceLanguage(TranslateLanguage.JAPANESE)
+                .setTargetLanguage(TranslateLanguage.ENGLISH)
+                .build()
         )
-        val conn = url.openConnection() as HttpURLConnection
-        try {
-            conn.requestMethod = "GET"
-            conn.connectTimeout = 5000
-            conn.readTimeout = 5000
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android) JpLens/0.1")
-            val code = conn.responseCode
-            if (code != 200) throw IOException("HTTP $code")
-            val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-            return parse(body)
-        } finally {
-            conn.disconnect()
+    }
+
+    // Cached "both models present" flag. Set true once a check or download confirms it,
+    // so the hot path (and the overlay's gate) doesn't re-query every time.
+    @Volatile private var modelReady = false
+
+    /**
+     * Whether the JA + EN models are already on the device. Cheap once cached; the first
+     * call does a local (no-network) lookup. Blocking — call off the main thread.
+     */
+    fun isDownloaded(): Boolean {
+        if (modelReady) return true
+        return try {
+            val mgr = RemoteModelManager.getInstance()
+            val ja = TranslateRemoteModel.Builder(TranslateLanguage.JAPANESE).build()
+            val en = TranslateRemoteModel.Builder(TranslateLanguage.ENGLISH).build()
+            val ok = Tasks.await(mgr.isModelDownloaded(ja)) && Tasks.await(mgr.isModelDownloaded(en))
+            if (ok) modelReady = true
+            ok
+        } catch (t: Throwable) {
+            Log.e(TAG, "Model state check failed", t)
+            false
         }
     }
 
     /**
-     * Response shape: [ [ ["translation","source",null,null,1], ... ], null, "ja", ... ]
-     * Concatenate every segment's [0] element.
+     * Download the JA→EN models (no-op if already present). Returns true on success.
+     * Needs network the first time; blocking — call off the main thread.
      */
-    private fun parse(body: String): String {
+    fun downloadModel(requireWifi: Boolean = false): Boolean {
         return try {
-            val root = JSONArray(body)
-            if (root.length() == 0 || root.isNull(0)) return ""
-            val segments = root.getJSONArray(0)
-            val sb = StringBuilder()
-            for (i in 0 until segments.length()) {
-                val seg = segments.optJSONArray(i) ?: continue
-                if (seg.length() > 0 && !seg.isNull(0)) sb.append(seg.getString(0))
-            }
-            sb.toString().trim()
-        } catch (e: Exception) {
-            Log.e(TAG, "parse failed: ${body.take(200)}", e)
+            val conditions = DownloadConditions.Builder()
+                .apply { if (requireWifi) requireWifi() }
+                .build()
+            Tasks.await(translator.downloadModelIfNeeded(conditions))
+            modelReady = true
+            true
+        } catch (t: Throwable) {
+            Log.e(TAG, "Model download failed", t)
+            false
+        }
+    }
+
+    /**
+     * Translate [text] JA→EN. Returns "" if the input is blank or the model isn't
+     * downloaded yet (it does NOT trigger a download — the home screen does that).
+     * Blocking — call off the main thread.
+     */
+    fun translateJaToEn(text: String): String {
+        if (text.isBlank()) return ""
+        if (!isDownloaded()) return ""
+        return try {
+            Tasks.await(translator.translate(text)).trim()
+        } catch (t: Throwable) {
+            Log.e(TAG, "Translate failed", t)
             ""
         }
     }

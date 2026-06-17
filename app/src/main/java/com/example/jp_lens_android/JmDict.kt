@@ -41,7 +41,9 @@ object JmDict {
     //    and per-writing/reading "j" JLPT tags in the detail blob.
     // v4: shipped the *lite* db (common/JLPT words only, ~11 MB vs ~102 MB) to keep
     //    the APK small — same schema; see scripts/build_jmdict_db.py --lite / --shrink.
-    private const val DB_ASSET_VERSION = 4
+    // v5: back to the *full* db (~98 MB, all ~217k words) — same schema; forces installs
+    //    holding the lite db to re-copy. Built with `python3 scripts/build_jmdict_db.py`.
+    private const val DB_ASSET_VERSION = 5
     private const val PREF_COPIED_VERSION = "jmdict_db_copied_version"
 
     @Volatile private var db: SQLiteDatabase? = null
