@@ -22,3 +22,8 @@ local.properties
 
 # Generated Anki decks (built by scripts/build_anki_apkg.py).
 /*.apkg
+
+# Release signing — never commit the keystore or its credentials.
+*.jks
+*.keystore
+/app/keystore.properties

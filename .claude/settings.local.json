@@ -31,7 +31,8 @@
       "Bash(python3 -m pip --version)",
       "Bash(python3 -m pip install --quiet --user sudachipy)",
       "Bash(git ls-tree *)",
-      "Bash(grep *)"
+      "Bash(grep *)",
+      "Bash(git check-ignore *)"
     ]
   }
 }

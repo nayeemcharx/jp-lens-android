@@ -1,6 +1,15 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
+}
+
+// Release signing: reads credentials from app/keystore.properties (gitignored).
+// Missing file => no release signingConfig, so debug builds still work without it.
+val keystorePropsFile = rootProject.file("app/keystore.properties")
+val keystoreProps = Properties().apply {
+    if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
 }
 
 android {
@@ -21,6 +30,17 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        if (keystorePropsFile.exists()) {
+            create("release") {
+                storeFile = file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -28,6 +48,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            if (keystorePropsFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
     compileOptions {
@@ -36,6 +59,13 @@ android {
     }
     buildFeatures {
         compose = true
+    }
+    lint {
+        // The AnkiDroid API artifact ships AnkiDroid's own internal lint checks
+        // (com.ichi2.anki.lint). DirectSystemCurrentTimeMillisUsage is a house rule
+        // for their testable Time collection and doesn't apply to this app; it fires
+        // on our own System.currentTimeMillis() calls and fails the release build.
+        disable += "DirectSystemCurrentTimeMillisUsage"
     }
     packaging {
         resources {
