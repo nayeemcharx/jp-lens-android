@@ -335,54 +335,8 @@ fun PermissionFlow(
             Hint("Screen-capture access is requested each time you press Start (system prompt).")
         }
 
-        // ── LLM mode (Anthropic) ─────────────────────────────────────
-        SectionCard("2 · LLM mode (optional)") {
-            EditableField(
-                label = "Anthropic API key",
-                value = apiKey,
-                masked = true,
-                onSave = {
-                    apiKey = it
-                    prefs.edit().putString(OverlayService.PREF_ANTHROPIC_KEY, it).apply()
-                },
-            )
-            StatusLine(
-                apiKey.isNotBlank(),
-                if (apiKey.isNotBlank()) "LLM mode enabled" else "Add a key to enable LLM mode",
-            )
-            Hint("With a key set, “LLM” appears in the overlay's hold-menu for AI sentence breakdowns. Without it, you still have 言葉 (word) & 文 (offline sentence dictionary) modes.")
-        }
-
-        // ── AnkiDroid ────────────────────────────────────────────────
-        SectionCard("3 · Add to AnkiDroid (optional)") {
-            EditableField(
-                label = "Deck name",
-                value = deckName,
-                onSave = {
-                    deckName = it
-                    prefs.edit().putString(OverlayService.PREF_ANKI_DECK, it).apply()
-                },
-            )
-            when {
-                !ankiInstalled -> {
-                    StatusLine(false, "AnkiDroid isn't installed")
-                    OutlinedButton(onClick = { openPlayStore("com.ichi2.anki") }) { Text("Get AnkiDroid") }
-                }
-                !ankiPermission -> {
-                    StatusLine(false, "AnkiDroid access not enabled")
-                    OutlinedButton(onClick = { ankiPermLauncher.launch(AnkiDroidHelper.PERMISSION) }) {
-                        Text("Enable AnkiDroid access")
-                    }
-                    Hint("If no dialog appears, open AnkiDroid → Settings → Advanced → “Enable AnkiDroid API”, then tap again.")
-                }
-                deckName.isBlank() -> StatusLine(false, "Enter a deck name above")
-                else -> StatusLine(true, "Ready — cards go to deck “${deckName.trim()}”")
-            }
-            Hint("The “+” (add card) button shows on overlay words only when this is fully set up.")
-        }
-
         // ── Offline translation model ────────────────────────────────
-        SectionCard("4 · Offline translation (optional)") {
+        SectionCard("2 · Offline translation (optional)") {
             if (modelState == "ready") {
                 StatusLine(true, "Translation model downloaded — works offline")
             } else {
@@ -411,8 +365,54 @@ fun PermissionFlow(
                         }
                     )
                 }
-                Hint("~30 MB, one-time download. Until it's installed, translations are unavailable.")
+                Hint("~30 MB, one-time download. Until it's installed, full sentence translations are unavailable.")
             }
+        }
+
+        // ── LLM mode (Anthropic) ─────────────────────────────────────
+        SectionCard("3 · LLM mode (optional)") {
+            EditableField(
+                label = "Anthropic API key",
+                value = apiKey,
+                masked = true,
+                onSave = {
+                    apiKey = it
+                    prefs.edit().putString(OverlayService.PREF_ANTHROPIC_KEY, it).apply()
+                },
+            )
+            StatusLine(
+                apiKey.isNotBlank(),
+                if (apiKey.isNotBlank()) "LLM mode enabled" else "Add a key to enable LLM mode",
+            )
+            Hint("With a key set, “LLM” appears in the overlay's hold-menu for AI sentence breakdowns(uses haiku 4.5). Without it, you still have 言葉 (word) & 文 (offline sentence dictionary) modes.")
+        }
+
+        // ── AnkiDroid ────────────────────────────────────────────────
+        SectionCard("4 · Add to AnkiDroid (optional)") {
+            EditableField(
+                label = "Deck name",
+                value = deckName,
+                onSave = {
+                    deckName = it
+                    prefs.edit().putString(OverlayService.PREF_ANKI_DECK, it).apply()
+                },
+            )
+            when {
+                !ankiInstalled -> {
+                    StatusLine(false, "AnkiDroid isn't installed")
+                    OutlinedButton(onClick = { openPlayStore("com.ichi2.anki") }) { Text("Get AnkiDroid") }
+                }
+                !ankiPermission -> {
+                    StatusLine(false, "AnkiDroid access not enabled")
+                    OutlinedButton(onClick = { ankiPermLauncher.launch(AnkiDroidHelper.PERMISSION) }) {
+                        Text("Enable AnkiDroid access")
+                    }
+                    Hint("If no dialog appears, open AnkiDroid → Settings → Advanced → “Enable AnkiDroid API”, then tap again.")
+                }
+                deckName.isBlank() -> StatusLine(false, "Enter a deck name above")
+                else -> StatusLine(true, "Ready — cards go to deck “${deckName.trim()}”")
+            }
+            Hint("The “+” (add card) button shows on overlay words only when this is fully set up.")
         }
 
         // ── Start / Stop ─────────────────────────────────────────────
