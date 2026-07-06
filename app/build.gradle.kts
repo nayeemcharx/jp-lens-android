@@ -77,6 +77,11 @@ android {
             )
         }
     }
+    // NOTE: deliberately NOT adding `androidResources { noCompress += "onnx" }`.
+    // The int8 FuguMT weights compress ~30% (90 MB -> ~63 MB), which matters for the
+    // Play 200 MB compressed-download limit, and Translator copies them to internal
+    // storage before opening (ORT loads by path), so leaving them DEFLATE-compressed in
+    // the APK only costs a one-time inflate on first run — no runtime penalty.
 }
 
 dependencies {
@@ -89,7 +94,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.mlkit.text.recognition.japanese)
-    implementation(libs.mlkit.translate)
+    implementation(libs.onnxruntime.android)
     implementation(libs.kotlinx.coroutines.play.services)
     implementation(libs.kuromoji.ipadic)
     implementation(libs.anki.droid.api)

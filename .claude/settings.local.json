@@ -32,7 +32,15 @@
       "Bash(python3 -m pip install --quiet --user sudachipy)",
       "Bash(git ls-tree *)",
       "Bash(grep *)",
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(\" CLAUDE.md)",
+      "Bash(/tmp/claude-1000/-mnt-c-Users-nnaye-AndroidStudioProjects-jplensandroid/b7b2b0c3-2285-4db6-b152-f2cd7f7fc702/scratchpad/fugumt-venv/bin/python -m pip install --no-input optimum-onnx)",
+      "Bash(unzip -l app-release.apk)",
+      "Bash(sort -k1 -n -r)",
+      "Bash(awk '{a[$4 ~ /arm64/ ? \"arm64\" : $4 ~ /armeabi/ ? \"armeabi\" : $4 ~ /x86_64/ ? \"x86_64\" : \"x86\"] += $1} END {for \\(k in a\\) printf \"%-10s %10.1f MB\\\\n\", k, a[k]/1048576}')",
+      "Bash(unzip -v app-release.apk)",
+      "Bash(awk 'NR<=3 || $0 ~ /jmdict|onnx|onnxruntime|ocr_pipeline|kuromoji|classes[0-9]*\\\\.dex|source_spm|vocab\\\\.json/')",
+      "Bash(awk ' *)"
     ]
   }
 }

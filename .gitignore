@@ -20,6 +20,9 @@ local.properties
 # Sudachi system dictionary (fetched by scripts/build_sudachi_dict.py); ~140 MB, not committed.
 /app/src/main/assets/system_full.dic
 
+# FuguMT offline translation bundle (built by scripts/build_fugumt.py); ~80 MB, not committed.
+/app/src/main/assets/fugumt/
+
 # Generated Anki decks (built by scripts/build_anki_apkg.py).
 /*.apkg
 

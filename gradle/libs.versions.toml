@@ -9,14 +9,14 @@ activityCompose = "1.8.0"
 kotlin = "2.2.10"
 composeBom = "2026.02.01"
 mlkitTextJapanese = "16.0.1"
-mlkitTranslate = "17.0.3"
+onnxruntimeAndroid = "1.27.0"
 kotlinxCoroutinesPlayServices = "1.8.1"
 kuromojiIpadic = "0.9.0"
 ankiDroidApi = "api-v1.1.0"
 
 [libraries]
 mlkit-text-recognition-japanese = { group = "com.google.mlkit", name = "text-recognition-japanese", version.ref = "mlkitTextJapanese" }
-mlkit-translate = { group = "com.google.mlkit", name = "translate", version.ref = "mlkitTranslate" }
+onnxruntime-android = { group = "com.microsoft.onnxruntime", name = "onnxruntime-android", version.ref = "onnxruntimeAndroid" }
 kotlinx-coroutines-play-services = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-play-services", version.ref = "kotlinxCoroutinesPlayServices" }
 kuromoji-ipadic = { group = "com.atilika.kuromoji", name = "kuromoji-ipadic", version.ref = "kuromojiIpadic" }
 anki-droid-api = { group = "com.github.ankidroid", name = "Anki-Android", version.ref = "ankiDroidApi" }

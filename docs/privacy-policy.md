@@ -1,6 +1,6 @@
 # Privacy Policy — JP Lens
 
-**Last updated: 18 June 2026**
+**Last updated: 7 July 2026**
 
 JP Lens ("the app") is a free, open-source Android tool that recognises Japanese
 text on your screen and shows dictionary entries, readings, and translations on
@@ -22,11 +22,9 @@ optional LLM mode (described below).
 - **Text recognition and dictionary lookups.** Optical character recognition
   (Google ML Kit), Japanese word segmentation, and the bundled offline dictionary
   (JMdict / KANJIDIC2) all run entirely on your device.
-- **Offline translation.** Japanese→English translation uses Google ML Kit's
-  on-device translation. The translation model is downloaded once from Google's
-  servers when you choose to download it; after that, translation runs fully
-  offline. Downloading the model is governed by
-  [Google's Privacy Policy](https://policies.google.com/privacy).
+- **Offline translation.** Japanese→English translation uses the FuguMT model,
+  which is bundled inside the app. It runs entirely on your device and **never
+  downloads anything or contacts a server**.
 - **Your settings.** Your preferences — including any Anthropic API key and your
   AnkiDroid deck name — are stored only in the app's private local storage on your
   device. They are not transmitted to the developer.
@@ -52,8 +50,8 @@ optional LLM mode (described below).
   text currently on screen.
 - **Notifications** — to show the required "screen capture active" notification
   while the overlay service is running.
-- **Internet** — only for the optional LLM mode and the one-time download of the
-  offline translation model.
+- **Internet** — only for the optional LLM mode (sending the selected sentence to
+  Anthropic). Every other feature, including translation, works fully offline.
 - **AnkiDroid database access** (optional) — only if you use the "add to Anki"
   feature.
 
@@ -71,8 +69,10 @@ information from anyone, including children.
 
 JP Lens is open source. Dictionary data comes from JMdict / KANJIDIC2 (© the
 Electronic Dictionary Research and Development Group, licensed CC BY-SA 4.0) and
-JLPT vocabulary lists by Jonathan Waller (CC BY 4.0). Open-source library licenses
-are listed in the app under **About & privacy → Open-source licenses**.
+JLPT vocabulary lists by Jonathan Waller (CC BY 4.0); offline translation uses the
+FuguMT model by Satoshi Takahashi (CC BY-SA 4.0, derived from Marian / OPUS-MT).
+Open-source library licenses are listed in the app under
+**About & privacy → Open-source licenses**.
 
 ## Changes to this policy
 

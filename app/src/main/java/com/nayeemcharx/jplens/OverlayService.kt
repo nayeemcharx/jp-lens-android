@@ -220,6 +220,10 @@ class OverlayService : Service() {
                 val t0 = System.currentTimeMillis()
                 JmDict.warmUp(this)
                 Log.i(TAG, "JMdict warm-up: ${System.currentTimeMillis() - t0} ms (available=${JmDict.isAvailable()})")
+                // Offline FuguMT translation (dict-mode full sentence, morpheme-mode range).
+                val t1 = System.currentTimeMillis()
+                Translator.warmUp(this)
+                Log.i(TAG, "FuguMT warm-up: ${System.currentTimeMillis() - t1} ms (available=${Translator.isAvailable()})")
             }
         }
 
@@ -409,9 +413,13 @@ class OverlayService : Service() {
         clearSentenceBoxes()
         mode = newMode
         persistMode()
-        // Both dict mode and OCR/morpheme mode look words up in JMdict.
+        // Both dict mode and OCR/morpheme mode look words up in JMdict and use the
+        // offline FuguMT translator (dict full-sentence / morpheme range popups).
         if (newMode == MODE_SENTENCE_DICT || newMode == MODE_MORPHEME)
-            captureHandler?.post { JmDict.warmUp(this) }
+            captureHandler?.post {
+                JmDict.warmUp(this)
+                Translator.warmUp(this)
+            }
         updateOcrButtonAppearance()
         val name = when (newMode) {
             MODE_SENTENCE_LLM -> "LLM sentence"
@@ -1329,9 +1337,9 @@ class OverlayService : Service() {
         Log.i(TAG, "range = \"$rangeText\"   hira = \"$readingHira\"")
 
         Thread {
-            // Only show a translation when the offline model is downloaded (see the
-            // home screen's "Download translation model" button); otherwise omit it.
-            val ready = Translator.isDownloaded()
+            // Only show a translation when the offline FuguMT model is loaded (built by
+            // scripts/build_fugumt.py + warmed on entering this mode); otherwise omit it.
+            val ready = Translator.isAvailable()
             val result = if (ready) try {
                 Translator.translateJaToEn(rangeText)
             } catch (e: Throwable) {

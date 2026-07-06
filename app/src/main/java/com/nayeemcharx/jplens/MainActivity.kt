@@ -40,7 +40,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -54,7 +53,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.nayeemcharx.jplens.ui.theme.JplensandroidTheme
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
@@ -199,7 +197,6 @@ fun PermissionFlow(
     onAbout: () -> Unit = {},
 ) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
     var status by remember { mutableStateOf("") }
 
     val prefs = remember {
@@ -222,11 +219,11 @@ fun PermissionFlow(
     val ankiInstalled = remember(resumeTick) { AnkiDroidHelper.isAnkiInstalled(context) }
     val ankiPermission = remember(resumeTick) { AnkiDroidHelper.hasPermission(context) }
 
-    // Translation model: checking | absent | downloading | ready | failed.
+    // Offline translation model (FuguMT, bundled in the APK): checking | present | missing.
     var modelState by remember { mutableStateOf("checking") }
     LaunchedEffect(Unit) {
-        val ok = withContext(Dispatchers.IO) { Translator.isDownloaded() }
-        modelState = if (ok) "ready" else "absent"
+        val ok = withContext(Dispatchers.IO) { Translator.assetPresent(context) }
+        modelState = if (ok) "present" else "missing"
     }
 
     val ankiPermLauncher = rememberLauncherForActivityResult(
@@ -336,36 +333,17 @@ fun PermissionFlow(
         }
 
         // ── Offline translation model ────────────────────────────────
-        SectionCard("2 · Offline translation (optional)") {
-            if (modelState == "ready") {
-                StatusLine(true, "Translation model downloaded — works offline")
-            } else {
-                Button(
-                    onClick = {
-                        modelState = "downloading"
-                        scope.launch {
-                            val ok = withContext(Dispatchers.IO) { Translator.downloadModel() }
-                            modelState = if (ok) "ready" else "failed"
-                            Toast.makeText(
-                                context,
-                                if (ok) "Translation model downloaded — translation is now on."
-                                else "Download failed — check your connection and retry.",
-                                Toast.LENGTH_LONG
-                            ).show()
-                        }
-                    },
-                    enabled = modelState == "absent" || modelState == "failed",
-                ) {
-                    Text(
-                        when (modelState) {
-                            "checking" -> "Checking translation model…"
-                            "downloading" -> "Downloading translation model…"
-                            "failed" -> "Download failed — retry"
-                            else -> "Download translation model"
-                        }
-                    )
+        SectionCard("2 · Offline translation") {
+            when (modelState) {
+                "present" -> {
+                    StatusLine(true, "FuguMT translation model bundled — works fully offline, on-device.")
+                    Hint("Used for full-sentence translation in dict mode and range translation in word mode.")
                 }
-                Hint("~30 MB, one-time download. Until it's installed, full sentence translations are unavailable.")
+                "missing" -> {
+                    StatusLine(false, "Translation model not built into this APK.")
+                    Hint("Run scripts/build_fugumt.py to generate app/src/main/assets/fugumt/, then rebuild. Until then, full-sentence translations are unavailable.")
+                }
+                else -> Hint("Checking translation model…")
             }
         }
 
@@ -433,6 +411,7 @@ fun PermissionFlow(
             Text(status, style = MaterialTheme.typography.bodyMedium)
         }
         Hint("Tip: hold the floating button to switch mode or stop without reopening this screen.")
+        Hint("Tip: manga panels that mix horizontal & vertical text can throw off OCR — if detection looks off, just zoom in on the panel and try again :)")
 
         TextButton(onClick = onAbout, modifier = Modifier.fillMaxWidth()) {
             Text("About & privacy")
@@ -521,8 +500,8 @@ private fun AboutScreen(modifier: Modifier = Modifier, onBack: () -> Unit) {
                 "• Screen capture: when you press the floating button, the current screen is captured only " +
                     "to recognise text on it. It is processed in memory on your device and is never saved or uploaded.\n" +
                     "• Text recognition, word tokenisation, and the offline dictionary all run on-device.\n" +
-                    "• Offline translation uses Google ML Kit. The translation model is downloaded once from Google's " +
-                    "servers; after that, translation runs fully on-device.\n" +
+                    "• Offline translation uses the FuguMT model bundled inside the app. It runs fully " +
+                    "on-device and never downloads anything or contacts a server.\n" +
                     "• Your Anthropic API key and settings are stored only in this app's local storage.",
                 style = MaterialTheme.typography.bodyMedium,
             )
@@ -540,7 +519,7 @@ private fun AboutScreen(modifier: Modifier = Modifier, onBack: () -> Unit) {
                 "• Draw over other apps — to show the floating button and overlay boxes/popups.\n" +
                     "• Screen capture (asked each session) — to read text on screen.\n" +
                     "• Notifications — for the required “capture active” foreground-service notice.\n" +
-                    "• Internet — for optional LLM mode and the one-time translation-model download.\n" +
+                    "• Internet — only for optional LLM mode (sending sentence text to Anthropic). Everything else, including translation, works offline.\n" +
                     "• AnkiDroid access (optional) — to add flashcards.",
                 style = MaterialTheme.typography.bodyMedium,
             )
@@ -560,10 +539,12 @@ private const val LICENSES_TEXT =
     "Code libraries\n" +
         "• Jetpack Compose & AndroidX (Google) — Apache License 2.0\n" +
         "• Kotlin & kotlinx.coroutines (JetBrains) — Apache License 2.0\n" +
-        "• Google ML Kit: Text Recognition & Translation — Google ML Kit Terms; components under Apache License 2.0\n" +
+        "• Google ML Kit: Text Recognition — Google ML Kit Terms; components under Apache License 2.0\n" +
+        "• ONNX Runtime (Microsoft) — MIT License\n" +
         "• Kuromoji IPADIC (com.atilika.kuromoji) — Apache License 2.0\n" +
         "• AnkiDroid API (com.github.ankidroid) — GNU GPL v3.0\n\n" +
         "Dictionary & language data\n" +
         "• JMdict / KANJIDIC2 © Electronic Dictionary Research and Development Group — CC BY-SA 4.0\n" +
-        "• JLPT vocabulary lists by Jonathan Waller — CC BY 4.0\n\n" +
+        "• JLPT vocabulary lists by Jonathan Waller — CC BY 4.0\n" +
+        "• FuguMT ja→en translation model by Satoshi Takahashi — CC BY-SA 4.0 (derives from Marian/OPUS-MT, Helsinki-NLP)\n\n" +
         "Full license texts are available from each project. JP Lens itself is open source."
