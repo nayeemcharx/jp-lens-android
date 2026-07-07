@@ -40,7 +40,10 @@
       "Bash(awk '{a[$4 ~ /arm64/ ? \"arm64\" : $4 ~ /armeabi/ ? \"armeabi\" : $4 ~ /x86_64/ ? \"x86_64\" : \"x86\"] += $1} END {for \\(k in a\\) printf \"%-10s %10.1f MB\\\\n\", k, a[k]/1048576}')",
       "Bash(unzip -v app-release.apk)",
       "Bash(awk 'NR<=3 || $0 ~ /jmdict|onnx|onnxruntime|ocr_pipeline|kuromoji|classes[0-9]*\\\\.dex|source_spm|vocab\\\\.json/')",
-      "Bash(awk ' *)"
+      "Bash(awk ' *)",
+      "Bash(unzip -l app/release/app-release.apk)",
+      "Bash(awk 'NR>3 && $1 ~ /^[0-9]+$/ {print $1, $4}')",
+      "Bash(awk 'NR>3 && $1 ~ /^[0-9]+$/ {n=$4; sub\\(/\\\\/.*/,\"\",n\\); s[n]+=$1} END {for \\(k in s\\) printf \"%8.2f MB  %s\\\\n\", s[k]/1048576, k}')"
     ]
   }
 }

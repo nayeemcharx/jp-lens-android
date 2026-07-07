@@ -140,7 +140,7 @@ private fun Hint(text: String) {
 /**
  * A read-only value with an "Edit" (or "Set", when empty) button; tapping it reveals the
  * text field with Save / Cancel. The field is only shown while editing. [masked] hides the
- * value (for the API key) in both display and edit modes.
+ * value (for sensitive fields) in both display and edit modes.
  */
 @Composable
 private fun EditableField(
@@ -201,9 +201,6 @@ fun PermissionFlow(
 
     val prefs = remember {
         context.getSharedPreferences(OverlayService.PREFS_NAME, Context.MODE_PRIVATE)
-    }
-    var apiKey by remember {
-        mutableStateOf(prefs.getString(OverlayService.PREF_ANTHROPIC_KEY, "") ?: "")
     }
     var deckName by remember {
         mutableStateOf(prefs.getString(OverlayService.PREF_ANKI_DECK, "JP Lens") ?: "JP Lens")
@@ -347,26 +344,8 @@ fun PermissionFlow(
             }
         }
 
-        // ── LLM mode (Anthropic) ─────────────────────────────────────
-        SectionCard("3 · LLM mode (optional)") {
-            EditableField(
-                label = "Anthropic API key",
-                value = apiKey,
-                masked = true,
-                onSave = {
-                    apiKey = it
-                    prefs.edit().putString(OverlayService.PREF_ANTHROPIC_KEY, it).apply()
-                },
-            )
-            StatusLine(
-                apiKey.isNotBlank(),
-                if (apiKey.isNotBlank()) "LLM mode enabled" else "Add a key to enable LLM mode",
-            )
-            Hint("With a key set, “LLM” appears in the overlay's hold-menu for AI sentence breakdowns(uses haiku 4.5). Without it, you still have 言葉 (word) & 文 (offline sentence dictionary) modes.")
-        }
-
         // ── AnkiDroid ────────────────────────────────────────────────
-        SectionCard("4 · Add to AnkiDroid (optional)") {
+        SectionCard("3 · Add to AnkiDroid (optional)") {
             EditableField(
                 label = "Deck name",
                 value = deckName,
@@ -421,9 +400,8 @@ fun PermissionFlow(
 
 /**
  * About screen: what the app is + how to reach the author, and a privacy/permissions
- * notice (required because we use Google ML Kit and screen capture, and because LLM mode
- * sends text to a third party). The "Open-source licenses" button toggles a static
- * attribution list ([LICENSES_TEXT]).
+ * notice (the app uses Google ML Kit and screen capture, all on-device). The
+ * "Open-source licenses" button toggles a static attribution list ([LICENSES_TEXT]).
  */
 @Composable
 private fun AboutScreen(modifier: Modifier = Modifier, onBack: () -> Unit) {
@@ -492,7 +470,8 @@ private fun AboutScreen(modifier: Modifier = Modifier, onBack: () -> Unit) {
         // ── Privacy & permissions ────────────────────────────────────
         SectionCard("Privacy & permissions") {
             Text(
-                "JP Lens does not collect, store, or share any personal data, and has no ads or analytics.",
+                "JP Lens does not collect, store, or share any personal data, and has no ads or analytics. " +
+                    "Everything runs on your device — the app has no servers and makes no network requests.",
                 style = MaterialTheme.typography.bodyMedium,
             )
             Text("What stays on your device", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
@@ -502,16 +481,14 @@ private fun AboutScreen(modifier: Modifier = Modifier, onBack: () -> Unit) {
                     "• Text recognition, word tokenisation, and the offline dictionary all run on-device.\n" +
                     "• Offline translation uses the FuguMT model bundled inside the app. It runs fully " +
                     "on-device and never downloads anything or contacts a server.\n" +
-                    "• Your Anthropic API key and settings are stored only in this app's local storage.",
+                    "• Your settings are stored only in this app's local storage.",
                 style = MaterialTheme.typography.bodyMedium,
             )
-            Text("What leaves your device", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text("Nothing is sent off your device", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Text(
-                "• LLM mode (optional): only if you add an Anthropic API key and use LLM mode, the selected " +
-                    "sentence text is sent to Anthropic's API for analysis, using your key. This is subject to " +
-                    "Anthropic's privacy policy. If you never enable it, no screen text leaves your device.\n" +
-                    "• AnkiDroid (optional): if you tap “+”, the chosen word/card is written to the AnkiDroid app on " +
-                    "your device via its local API. Nothing is sent to a server by JP Lens.",
+                "• JP Lens makes no network requests. No screen text, image, or lookup ever leaves your device.\n" +
+                    "• AnkiDroid (optional): if you tap “+”, the chosen word/card is written to the AnkiDroid app " +
+                    "already on your device via its local API — nothing is sent to any server.",
                 style = MaterialTheme.typography.bodyMedium,
             )
             Text("Permissions used", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
@@ -519,7 +496,6 @@ private fun AboutScreen(modifier: Modifier = Modifier, onBack: () -> Unit) {
                 "• Draw over other apps — to show the floating button and overlay boxes/popups.\n" +
                     "• Screen capture (asked each session) — to read text on screen.\n" +
                     "• Notifications — for the required “capture active” foreground-service notice.\n" +
-                    "• Internet — only for optional LLM mode (sending sentence text to Anthropic). Everything else, including translation, works offline.\n" +
                     "• AnkiDroid access (optional) — to add flashcards.",
                 style = MaterialTheme.typography.bodyMedium,
             )

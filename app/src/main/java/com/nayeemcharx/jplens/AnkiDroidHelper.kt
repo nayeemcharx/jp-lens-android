@@ -55,19 +55,8 @@ object AnkiDroidHelper {
         data class Failed(val message: String) : AddResult()
     }
 
-    /** Summary card: back built from the structured fields. */
-    fun addCard(
-        context: Context,
-        word: String,
-        reading: String,
-        meaning: String,
-        jlpt: String = "",
-        sentence: String = "",
-        translation: String = "",
-    ): AddResult = addCard(context, word, buildBack(reading, meaning, jlpt, word, sentence, translation))
-
     /**
-     * Core add: front + an already-formatted back (plain text or HTML — Anki renders
+     * Add: front + an already-formatted back (plain text or HTML — Anki renders
      * the field through a WebView). Find-or-creates the deck/model and dedupes on front.
      */
     fun addCard(context: Context, front: String, back: String): AddResult {
@@ -97,23 +86,6 @@ object AnkiDroidHelper {
             Log.e(TAG, "addCard failed", t)
             AddResult.Failed(t.message ?: t.javaClass.simpleName)
         }
-    }
-
-    private fun buildBack(
-        reading: String,
-        meaning: String,
-        jlpt: String,
-        word: String,
-        sentence: String,
-        translation: String,
-    ): String {
-        val sb = StringBuilder()
-        if (reading.isNotEmpty() && reading != word) sb.append(reading).append("\n\n")
-        sb.append(meaning)
-        if (jlpt.isNotEmpty()) sb.append("\n\n[").append(jlpt).append(']')
-        if (sentence.isNotEmpty()) sb.append("\n\n").append(sentence)
-        if (translation.isNotEmpty()) sb.append("\n").append(translation)
-        return sb.toString()
     }
 
     private fun findDeckId(api: AddContentApi, name: String): Long? =

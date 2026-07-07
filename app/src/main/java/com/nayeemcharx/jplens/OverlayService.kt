@@ -65,11 +65,10 @@ class OverlayService : Service() {
         const val EXTRA_MODE = "mode"
 
         const val MODE_MORPHEME = 0
-        const val MODE_SENTENCE_LLM = 1
+        // (1 was the former LLM sentence mode, removed.)
         const val MODE_SENTENCE_DICT = 2
 
         const val PREFS_NAME = "jp_lens"
-        const val PREF_ANTHROPIC_KEY = "anthropic_api_key"
         // AnkiDroid deck name the "+" button adds cards to (set on the home screen).
         const val PREF_ANKI_DECK = "anki_deck_name"
         // Last capture mode chosen (start button resumes it; radial menu updates it).
@@ -107,8 +106,8 @@ class OverlayService : Service() {
 
     private data class PopupHolder(val view: View, val translationView: TextView)
     private var popup: PopupHolder? = null
-    // Set by the LLM popup's drag handler; suppresses auto-reposition so a
-    // user-positioned popup doesn't jump when the response arrives.
+    // Set by the analysis popup's drag handler; suppresses auto-reposition so a
+    // user-positioned popup doesn't jump when its content fills in.
     private var userMovedPopup = false
 
     private data class MorphemeBox(
@@ -127,7 +126,7 @@ class OverlayService : Service() {
     private data class RenderedBox(val view: View, val box: MorphemeBox)
     private val renderedBoxes = mutableListOf<RenderedBox>()
 
-    // Sentence-mode overlays (MODE_SENTENCE_LLM).
+    // Sentence-mode overlays (MODE_SENTENCE_DICT).
     private data class SentenceBox(
         val left: Int,
         val top: Int,
@@ -180,10 +179,11 @@ class OverlayService : Service() {
         startForegroundCompat()
 
         mode = intent.getIntExtra(EXTRA_MODE, MODE_MORPHEME)
-        // Don't resume LLM mode when no Anthropic key is configured.
-        if (mode == MODE_SENTENCE_LLM && !isAnthropicConfigured()) mode = MODE_MORPHEME
+        // Only two modes remain; anything else (e.g. a mode persisted by an older
+        // install that had LLM mode) falls back to morpheme.
+        if (mode != MODE_MORPHEME && mode != MODE_SENTENCE_DICT) mode = MODE_MORPHEME
         persistMode()
-        Log.i(TAG, "Starting mode=$mode (0=morpheme, 1=sentence+LLM, 2=sentence+JMdict)")
+        Log.i(TAG, "Starting mode=$mode (0=morpheme, 2=sentence+JMdict)")
 
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
         val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -212,19 +212,16 @@ class OverlayService : Service() {
             JapaneseTokenizer.warmUp(this)
             Log.i(TAG, "Sudachi warm-up: ${System.currentTimeMillis() - t0} ms (available=${JapaneseTokenizer.isAvailable()})")
         }
-        // Dict mode and OCR/morpheme mode both use the offline JMdict SQLite
-        // asset (dict mode for word-by-word; OCR mode for the single-tap detail
-        // popup), so copy + open it up front for either.
-        if (mode == MODE_SENTENCE_DICT || mode == MODE_MORPHEME) {
-            captureHandler?.post {
-                val t0 = System.currentTimeMillis()
-                JmDict.warmUp(this)
-                Log.i(TAG, "JMdict warm-up: ${System.currentTimeMillis() - t0} ms (available=${JmDict.isAvailable()})")
-                // Offline FuguMT translation (dict-mode full sentence, morpheme-mode range).
-                val t1 = System.currentTimeMillis()
-                Translator.warmUp(this)
-                Log.i(TAG, "FuguMT warm-up: ${System.currentTimeMillis() - t1} ms (available=${Translator.isAvailable()})")
-            }
+        // Both modes use the offline JMdict SQLite asset (dict mode for word-by-word;
+        // morpheme mode for the single-tap detail popup) and the offline FuguMT
+        // translator (dict full-sentence / morpheme range), so warm both up front.
+        captureHandler?.post {
+            val t0 = System.currentTimeMillis()
+            JmDict.warmUp(this)
+            Log.i(TAG, "JMdict warm-up: ${System.currentTimeMillis() - t0} ms (available=${JmDict.isAvailable()})")
+            val t1 = System.currentTimeMillis()
+            Translator.warmUp(this)
+            Log.i(TAG, "FuguMT warm-up: ${System.currentTimeMillis() - t1} ms (available=${Translator.isAvailable()})")
         }
 
         setupVirtualDisplay()
@@ -302,7 +299,6 @@ class OverlayService : Service() {
         val active = renderedBoxes.isNotEmpty() || renderedSentenceBoxes.isNotEmpty()
         btn.text = when {
             active -> "✕"
-            mode == MODE_SENTENCE_LLM -> "LLM"
             mode == MODE_SENTENCE_DICT -> "文"
             else -> "言葉"
         }
@@ -315,7 +311,6 @@ class OverlayService : Service() {
                 shape = GradientDrawable.OVAL
                 setColor(
                     when (mode) {
-                        MODE_SENTENCE_LLM -> Color.argb(220, 140, 60, 200)
                         MODE_SENTENCE_DICT -> Color.argb(220, 40, 160, 120)
                         else -> Color.argb(220, 30, 100, 220)
                     }
@@ -397,15 +392,10 @@ class OverlayService : Service() {
             .putInt(PREF_LAST_MODE, mode).apply()
     }
 
-    /** LLM mode is offered (radial menu) only when an Anthropic API key is set. */
-    private fun isAnthropicConfigured(): Boolean =
-        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getString(PREF_ANTHROPIC_KEY, "").orEmpty().isNotBlank()
-
     /**
      * Switches capture mode live without reopening the app. The MediaProjection is
      * already granted, so this just swaps the `mode` field, drops stale overlays, and
-     * (for dict mode) warms the offline dictionary.
+     * warms the offline dictionary + translator.
      */
     private fun setMode(newMode: Int) {
         if (newMode == mode) return
@@ -413,16 +403,14 @@ class OverlayService : Service() {
         clearSentenceBoxes()
         mode = newMode
         persistMode()
-        // Both dict mode and OCR/morpheme mode look words up in JMdict and use the
-        // offline FuguMT translator (dict full-sentence / morpheme range popups).
-        if (newMode == MODE_SENTENCE_DICT || newMode == MODE_MORPHEME)
-            captureHandler?.post {
-                JmDict.warmUp(this)
-                Translator.warmUp(this)
-            }
+        // Both modes look words up in JMdict and use the offline FuguMT translator
+        // (dict full-sentence / morpheme range popups).
+        captureHandler?.post {
+            JmDict.warmUp(this)
+            Translator.warmUp(this)
+        }
         updateOcrButtonAppearance()
         val name = when (newMode) {
-            MODE_SENTENCE_LLM -> "LLM sentence"
             MODE_SENTENCE_DICT -> "JMdict sentence"
             else -> "word"
         }
@@ -441,7 +429,7 @@ class OverlayService : Service() {
 
     /**
      * Half-circle mode-switch menu shown after holding the floating button. The
-     * options (three modes + Stop) fan out on a semicircle **away from the screen
+     * options (two modes + Stop) fan out on a semicircle **away from the screen
      * edge** — button on the left → options open to the right, and vice-versa, so
      * they never run off-screen. The window itself is passive (`NOT_TOUCHABLE`);
      * the same finger-down that opened it keeps steering [updateRadialSelection],
@@ -458,9 +446,6 @@ class OverlayService : Service() {
 
         val options = buildList {
             add(MenuOption("言葉", Color.argb(235, 30, 100, 220)) { setMode(MODE_MORPHEME) })
-            // LLM only appears when an Anthropic key is configured (home screen).
-            if (isAnthropicConfigured())
-                add(MenuOption("LLM", Color.argb(235, 140, 60, 200)) { setMode(MODE_SENTENCE_LLM) })
             add(MenuOption("文", Color.argb(235, 40, 160, 120)) { setMode(MODE_SENTENCE_DICT) })
             add(MenuOption("Stop", Color.argb(235, 220, 80, 60)) { stopSelf() })
         }
@@ -679,7 +664,7 @@ class OverlayService : Service() {
 
     /** Both sentence modes share the OCR → sentence-box pipeline; only the popup differs. */
     private fun isSentenceMode(): Boolean =
-        mode == MODE_SENTENCE_LLM || mode == MODE_SENTENCE_DICT
+        mode == MODE_SENTENCE_DICT
 
     private fun computeMorphemeBoxes(visionText: Text): List<MorphemeBox> {
         val out = mutableListOf<MorphemeBox>()
@@ -1355,26 +1340,21 @@ class OverlayService : Service() {
         }.start()
     }
 
-    // ───────────────────────── Sentence mode (LLM) ─────────────────────────
+    // ───────────────────────── Sentence mode (dict) ─────────────────────────
 
-    /**
-     * Converts inline `**bold**` markdown to actual bold spans. The LLM sometimes
-     * emits emphasis markup which would otherwise show up as literal asterisks
-     * in the popup. Anything that isn't a `**…**` pair is passed through verbatim.
-     */
     /**
      * Build one row of the Word-by-word section: word text on the left, a small
      * "+" button on the right that adds the word to AnkiDroid as a card.
      */
     private fun buildWordRow(
-        entry: AnthropicClient.WordEntry,
+        entry: WordEntry,
         textMaxW: Int,
         sentence: String,
         translation: String,
         expandable: Boolean = false,
     ): View {
-        // Show the surface (the text as it appears in the sentence) when we have it;
-        // LLM-mode entries leave surface empty and fall back to the word form.
+        // Show the surface (the text as it appears in the sentence) when we have it,
+        // falling back to the lookup/word form when no surface was set.
         val display = entry.surface.ifEmpty { entry.word }
         val labelText = buildString {
             append(display)
@@ -1409,10 +1389,8 @@ class OverlayService : Service() {
                 contentDescription = "Add to AnkiDroid"
             }
             b.setOnClickListener {
-                // Dict mode (expandable): card back = the full JMdict detail blob.
-                // LLM mode: card back = the summary (reading/meaning/JLPT/sentence).
-                if (expandable) handleAddToAnkiDict(entry, b, sentence, translation)
-                else handleAddToAnki(entry, b, sentence, translation)
+                // Card back = the full JMdict detail blob for this word.
+                handleAddToAnkiDict(entry, b, sentence, translation)
             }
             b
         } else null
@@ -1723,31 +1701,12 @@ class OverlayService : Service() {
         }
     }
 
-    /** LLM-mode add: front = word, back = the summary (reading/meaning/JLPT/sentence). */
-    private fun handleAddToAnki(
-        entry: AnthropicClient.WordEntry,
-        btn: TextView,
-        sentence: String,
-        translation: String,
-    ) {
-        if (!ankiPreflight()) return
-        // Disable the button during the (blocking) add so duplicate taps don't double-add.
-        btn.isEnabled = false
-        btn.alpha = 0.5f
-        Thread {
-            val result = AnkiDroidHelper.addCard(
-                this, entry.word, entry.reading, entry.meaning, entry.jlpt, sentence, translation
-            )
-            mainHandler.post { applyAnkiResult(result, btn, entry.word) }
-        }.start()
-    }
-
     /**
      * Dict-mode add: front = the word (kanji form, no kana reading); back = the full
      * JMdict detail blob rendered as HTML (all senses, POS, tags, xrefs, loanword, …).
      */
     private fun handleAddToAnkiDict(
-        entry: AnthropicClient.WordEntry,
+        entry: WordEntry,
         btn: TextView,
         sentence: String,
         translation: String,
@@ -1774,7 +1733,7 @@ class OverlayService : Service() {
      * translation. Colors are chosen to read on Anki's default white background.
      */
     private fun buildAnkiBackHtml(
-        entry: AnthropicClient.WordEntry,
+        entry: WordEntry,
         details: List<JmDict.WordDetail>,
         kanji: List<Pair<Char, JmDict.KanjiInfo>>,
         sentence: String,
@@ -1887,22 +1846,6 @@ class OverlayService : Service() {
         return sb.toString()
     }
 
-    private fun renderInlineMarkdown(s: String): CharSequence {
-        if (s.isEmpty() || !s.contains("**")) return s
-        val out = SpannableStringBuilder()
-        val re = Regex("""\*\*(.+?)\*\*""", RegexOption.DOT_MATCHES_ALL)
-        var i = 0
-        for (m in re.findAll(s)) {
-            if (m.range.first > i) out.append(s, i, m.range.first)
-            val start = out.length
-            out.append(m.groupValues[1])
-            out.setSpan(StyleSpan(Typeface.BOLD), start, out.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
-            i = m.range.last + 1
-        }
-        if (i < s.length) out.append(s, i, s.length)
-        return out
-    }
-
     private data class ElementRange(val box: android.graphics.Rect, val start: Int, val end: Int)
 
     private fun buildLineRanges(line: Text.Line, vertical: Boolean): Pair<String, List<ElementRange>> {
@@ -1987,7 +1930,7 @@ class OverlayService : Service() {
      * grouped into one logical sentence even when split across lines. Each
      * physical line-piece becomes its own clickable rectangle; all pieces of the
      * same sentence carry the same fullText (and same sentenceId) so any click
-     * triggers the LLM with the complete sentence.
+     * opens the analysis popup for the complete sentence.
      */
     private fun computeSentenceBoxes(visionText: Text): List<SentenceBox> {
         val terminators = setOf('。', '！', '？', '!', '?', '．', '.')
@@ -2116,14 +2059,14 @@ class OverlayService : Service() {
 
     private fun onSentenceClick(box: SentenceBox) {
         Log.i(TAG, "sentence tap → ${box.fullText}")
-        if (mode == MODE_SENTENCE_DICT) showDictAnalysisPopup(box)
-        else showLlmAnalysisPopup(box)
+        showDictAnalysisPopup(box)
     }
 
     /**
-     * The analysis popup scaffold shared by LLM mode and dict mode. Holds the
-     * section views each mode populates differently, plus the [reposition] helper
-     * that re-clamps the popup once its content grows.
+     * The offline dict-mode analysis popup scaffold. Holds the section views the
+     * dict lookup populates (Word-by-word list, Reading, Translation), plus the
+     * [reposition] helper that re-clamps the popup once its content grows. (The
+     * Kanji/Notes section views are unused leftovers from the removed LLM mode.)
      */
     private class AnalysisPopup(
         val holder: PopupHolder,
@@ -2203,8 +2146,8 @@ class OverlayService : Service() {
             textSize = 13f
             maxWidth = textMaxW
         }
-        // Structured per-word rows replace `wordBody` once the LLM response is parsed.
-        // Each row carries a "+ Anki" button that adds the word as a card.
+        // Structured per-word rows replace `wordBody` once the dictionary lookup
+        // completes. Each row carries a "+ Anki" button that adds the word as a card.
         val wordList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
@@ -2329,7 +2272,7 @@ class OverlayService : Service() {
             @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
         // Re-clamp the popup's on-screen position whenever its content changes
-        // size (e.g. when the LLM response arrives and sections become visible).
+        // size (e.g. when the dictionary lookup fills in the sections).
         fun reposition() {
             if (userMovedPopup) return
             val wSpec = View.MeasureSpec.makeMeasureSpec(maxPopupW, View.MeasureSpec.AT_MOST)
@@ -2397,7 +2340,7 @@ class OverlayService : Service() {
         // consumes its own touches first, so taps on it still close the popup;
         // anything else in the header row (title text + padding) drags.
         // Once dragged, suppress the auto-reposition that runs when content
-        // grows — otherwise the popup snaps back when the LLM response arrives.
+        // grows — otherwise the popup snaps back when the lookup fills in.
         var dragInitialX = 0
         var dragInitialY = 0
         var dragStartRawX = 0f
@@ -2442,66 +2385,11 @@ class OverlayService : Service() {
         )
     }
 
-    /** Sentence-mode popup backed by the Anthropic API (MODE_SENTENCE_LLM). */
-    private fun showLlmAnalysisPopup(box: SentenceBox) {
-        val ui = buildAnalysisPopup(box) ?: return
-
-        val apiKey = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getString(PREF_ANTHROPIC_KEY, "")
-            .orEmpty()
-            .trim()
-
-        if (apiKey.isEmpty()) {
-            ui.wordBody.text = "(missing Anthropic API key — set it in the app)"
-            ui.container.post { ui.reposition() }
-            return
-        }
-
-        val sentence = box.fullText
-        Thread {
-            val result = runCatching { AnthropicClient.analyzeJapanese(sentence, apiKey) }
-            mainHandler.post {
-                if (popup !== ui.holder) return@post
-                result.onSuccess { a ->
-                    if (a.words.isNotEmpty()) {
-                        ui.wordBody.visibility = View.GONE
-                        ui.wordList.removeAllViews()
-                        for (w in a.words) {
-                            ui.wordList.addView(buildWordRow(w, ui.textMaxW, box.fullText, a.translation))
-                        }
-                        ui.wordList.visibility = View.VISIBLE
-                    } else {
-                        ui.wordBody.text = if (a.wordByWord.isNotBlank())
-                            renderInlineMarkdown(a.wordByWord) else "(no analysis)"
-                    }
-                    if (a.kanji.isNotBlank() && a.kanji.trim() != "(none)") {
-                        ui.kanjiBody.text = renderInlineMarkdown(a.kanji)
-                        ui.kanjiHeader.visibility = View.VISIBLE
-                        ui.kanjiBody.visibility = View.VISIBLE
-                    }
-                    if (a.translation.isNotBlank()) {
-                        ui.transBody.text = renderInlineMarkdown(a.translation)
-                        ui.transHeader.visibility = View.VISIBLE
-                        ui.transBody.visibility = View.VISIBLE
-                    }
-                    if (a.notes.isNotBlank() && a.notes.trim() != "(none)") {
-                        ui.notesBody.text = renderInlineMarkdown(a.notes)
-                        ui.notesHeader.visibility = View.VISIBLE
-                        ui.notesBody.visibility = View.VISIBLE
-                    }
-                }.onFailure { e ->
-                    Log.e(TAG, "LLM analysis failed", e)
-                    ui.wordBody.text = "Error: ${e.message ?: e.javaClass.simpleName}"
-                }
-                ui.container.post { ui.reposition() }
-            }
-        }.start()
-    }
-
     /**
      * Offline sentence-mode popup (MODE_SENTENCE_DICT). Word-by-word comes from
-     * Kuromoji morphemes glossed against JMdict; the Kanji section from KANJIDIC2;
-     * the full-sentence translation from Google Translate. No LLM, so no Notes.
+     * Kuromoji morphemes glossed against JMdict (each row expandable to the full
+     * JMdict + KANJIDIC2 detail); the full-sentence translation from the offline
+     * FuguMT model. Everything runs on-device — nothing leaves the device.
      */
     private fun showDictAnalysisPopup(box: SentenceBox) {
         val ui = buildAnalysisPopup(box) ?: return
@@ -2520,7 +2408,7 @@ class OverlayService : Service() {
             // Sudachi's normalized form, which can canonicalize a kana word into a
             // rarely-used kanji. The gloss/detail/Anki still key off a dictionary
             // lookup form (see lookupKey below).
-            val entries = ArrayList<AnthropicClient.WordEntry>()
+            val entries = ArrayList<WordEntry>()
             if (available) {
                 val morphemes = runCatching { JapaneseTokenizer.extract(sentence) }
                     .getOrDefault(emptyList())
@@ -2543,7 +2431,7 @@ class OverlayService : Service() {
                         JapaneseTokenizer.katakanaToHiragana(m.reading) else ""
                     val info = JmDict.lookupWord(lookupKey)
                     val gloss = info?.gloss ?: "(not in dictionary)"
-                    entries += AnthropicClient.WordEntry(
+                    entries += WordEntry(
                         lookupKey, reading, gloss, info?.jlpt ?: "", surface = surface
                     )
                 }

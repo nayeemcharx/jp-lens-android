@@ -1,15 +1,15 @@
 # Privacy Policy — JP Lens
 
-**Last updated: 7 July 2026**
+**Last updated: 8 July 2026**
 
 JP Lens ("the app") is a free, open-source Android tool that recognises Japanese
 text on your screen and shows dictionary entries, readings, and translations on
 top of it. This policy explains what the app does and does not do with your data.
 
 **Short version:** JP Lens does not collect, store, or share any personal data. It
-has no accounts, no ads, and no analytics. Almost everything runs on your device.
-The only time any of your content leaves your device is if **you** turn on the
-optional LLM mode (described below).
+has no accounts, no ads, and no analytics. **Everything runs on your device** — the
+app has no servers and makes no network requests, so none of your content ever
+leaves your device.
 
 ---
 
@@ -25,19 +25,15 @@ optional LLM mode (described below).
 - **Offline translation.** Japanese→English translation uses the FuguMT model,
   which is bundled inside the app. It runs entirely on your device and **never
   downloads anything or contacts a server**.
-- **Your settings.** Your preferences — including any Anthropic API key and your
-  AnkiDroid deck name — are stored only in the app's private local storage on your
-  device. They are not transmitted to the developer.
+- **Your settings.** Your preferences — such as your AnkiDroid deck name — are
+  stored only in the app's private local storage on your device. They are not
+  transmitted to the developer.
 
-## Information that may leave your device (optional features only)
+## Nothing is sent off your device
 
-- **LLM mode (off by default).** This mode only works if you choose to enter your
-  own Anthropic API key and select LLM mode. When you do, the selected sentence of
-  recognised text is sent to **Anthropic's API** to produce a grammar/vocabulary
-  breakdown, authenticated with your key. That request is subject to
-  [Anthropic's Privacy Policy](https://www.anthropic.com/legal/privacy). If you
-  never enter a key and never use LLM mode, **no recognised text ever leaves your
-  device.**
+JP Lens makes **no network requests**. No screen image, recognised text, dictionary
+lookup, or translation ever leaves your device.
+
 - **AnkiDroid (optional).** If you tap the "+" button on a word, that word/card is
   written to the AnkiDroid app already installed on your device, using AnkiDroid's
   local on-device API. JP Lens does not send this data to any server.
@@ -50,10 +46,10 @@ optional LLM mode (described below).
   text currently on screen.
 - **Notifications** — to show the required "screen capture active" notification
   while the overlay service is running.
-- **Internet** — only for the optional LLM mode (sending the selected sentence to
-  Anthropic). Every other feature, including translation, works fully offline.
 - **AnkiDroid database access** (optional) — only if you use the "add to Anki"
   feature.
+
+JP Lens does **not** request the Internet permission.
 
 ## Data sharing and selling
 
