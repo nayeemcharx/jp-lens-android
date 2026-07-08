@@ -1,5 +1,6 @@
 package com.nayeemcharx.jplens
 
+import android.animation.ValueAnimator
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -67,6 +68,9 @@ class OverlayService : Service() {
         const val MODE_MORPHEME = 0
         // (1 was the former LLM sentence mode, removed.)
         const val MODE_SENTENCE_DICT = 2
+        // Translation-only sentence mode: same OCR/sentence pipeline as dict mode,
+        // but tapping a sentence shows only its offline FuguMT translation.
+        const val MODE_TRANSLATE = 3
 
         const val PREFS_NAME = "jp_lens"
         // AnkiDroid deck name the "+" button adds cards to (set on the home screen).
@@ -103,6 +107,17 @@ class OverlayService : Service() {
 
     private val mainHandler by lazy { Handler(mainLooper) }
     @Volatile private var isProcessing = false
+
+    // Frame-change watcher: while overlays are showing, periodically sample the
+    // captured screen and drop the (now-stale) overlays when the underlying content
+    // changes a lot — e.g. the user switches app/window while sharing the whole
+    // screen. Runs on captureHandler; baseline is a coarse grayscale signature.
+    @Volatile private var changeWatchActive = false
+    private var frameBaseline: IntArray? = null
+    private val changeWatchRunnable = Runnable { sampleFrameForChange() }
+    // Grid size for the signature (GRID×GRID cells) and per-cell change threshold.
+    private val changeGrid = 12
+    private val changeThreshold = 48
 
     private data class PopupHolder(val view: View, val translationView: TextView)
     private var popup: PopupHolder? = null
@@ -178,12 +193,11 @@ class OverlayService : Service() {
     private fun handleStart(intent: Intent) {
         startForegroundCompat()
 
-        mode = intent.getIntExtra(EXTRA_MODE, MODE_MORPHEME)
-        // Only two modes remain; anything else (e.g. a mode persisted by an older
-        // install that had LLM mode) falls back to morpheme.
-        if (mode != MODE_MORPHEME && mode != MODE_SENTENCE_DICT) mode = MODE_MORPHEME
+        // A fresh capture session always starts in sentence-dict (文) mode,
+        // regardless of the last-used mode; the radial menu switches live after.
+        mode = MODE_SENTENCE_DICT
         persistMode()
-        Log.i(TAG, "Starting mode=$mode (0=morpheme, 2=sentence+JMdict)")
+        Log.i(TAG, "Starting mode=$mode (0=morpheme, 2=sentence+JMdict, 3=translate)")
 
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
         val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -300,6 +314,7 @@ class OverlayService : Service() {
         btn.text = when {
             active -> "✕"
             mode == MODE_SENTENCE_DICT -> "文"
+            mode == MODE_TRANSLATE -> "訳"
             else -> "言葉"
         }
         btn.background = GradientDrawable().apply {
@@ -312,6 +327,7 @@ class OverlayService : Service() {
                 setColor(
                     when (mode) {
                         MODE_SENTENCE_DICT -> Color.argb(220, 40, 160, 120)
+                        MODE_TRANSLATE -> Color.argb(220, 150, 90, 210)
                         else -> Color.argb(220, 30, 100, 220)
                     }
                 )
@@ -359,8 +375,12 @@ class OverlayService : Service() {
                     ) {
                         moved = true
                         mainHandler.removeCallbacks(longPress)  // a drag isn't a long-press
-                        params.x = initialX + (event.rawX - touchStartX).toInt()
-                        params.y = initialY + (event.rawY - touchStartY).toInt()
+                        // Clamp within the screen so the button can't be lost off an edge.
+                        val metrics = resources.displayMetrics
+                        params.x = (initialX + (event.rawX - touchStartX).toInt())
+                            .coerceIn(0, (metrics.widthPixels - v.width).coerceAtLeast(0))
+                        params.y = (initialY + (event.rawY - touchStartY).toInt())
+                            .coerceIn(0, (metrics.heightPixels - v.height).coerceAtLeast(0))
                         windowManager.updateViewLayout(v, params)
                     }
                     true
@@ -377,6 +397,9 @@ class OverlayService : Service() {
                     } else if (!moved) {
                         // Plain tap (no drag, no menu) = capture/clear.
                         v.performClick()
+                    } else {
+                        // End of a drag: glide to the nearer horizontal edge.
+                        snapToEdge(v, params)
                     }
                     menuOpen = false
                     true
@@ -385,6 +408,27 @@ class OverlayService : Service() {
             }
         }
         view.setOnClickListener { captureAndRecognize() }
+    }
+
+    /**
+     * After a drag, animate the floating button to whichever horizontal screen edge
+     * it's closer to (a subtle "docking" feel), keeping it fully on-screen.
+     */
+    private fun snapToEdge(v: View, params: WindowManager.LayoutParams) {
+        val metrics = resources.displayMetrics
+        val maxX = (metrics.widthPixels - v.width).coerceAtLeast(0)
+        val margin = dp(8)
+        val targetX = if (params.x + v.width / 2 < metrics.widthPixels / 2) margin
+        else (maxX - margin).coerceAtLeast(0)
+        val startX = params.x
+        if (startX == targetX) return
+        val anim = ValueAnimator.ofInt(startX, targetX).apply { duration = 180 }
+        anim.addUpdateListener { a ->
+            if (floatingView !== v) { a.cancel(); return@addUpdateListener }
+            params.x = a.animatedValue as Int
+            runCatching { windowManager.updateViewLayout(v, params) }
+        }
+        anim.start()
     }
 
     private fun persistMode() {
@@ -412,20 +456,30 @@ class OverlayService : Service() {
         updateOcrButtonAppearance()
         val name = when (newMode) {
             MODE_SENTENCE_DICT -> "JMdict sentence"
+            MODE_TRANSLATE -> "translation"
             else -> "word"
         }
         Toast.makeText(this, "Mode: $name", Toast.LENGTH_SHORT).show()
     }
 
-    private data class MenuOption(val label: String, val color: Int, val action: () -> Unit)
+    private data class MenuOption(
+        val label: String,
+        val color: Int,
+        val desc: String,
+        val action: () -> Unit,
+    )
 
     /** A placed half-circle option: its view, fan angle, and tint, for hover styling. */
     private data class RadialOption(
         val view: TextView,
         val color: Int,
         val angleRad: Double,
+        val desc: String,
         val action: () -> Unit,
     )
+
+    // Hover-description label shown while the radial menu is open (task 4).
+    private var radialDescView: TextView? = null
 
     /**
      * Half-circle mode-switch menu shown after holding the floating button. The
@@ -445,9 +499,14 @@ class OverlayService : Service() {
         val screenH = metrics.heightPixels
 
         val options = buildList {
-            add(MenuOption("言葉", Color.argb(235, 30, 100, 220)) { setMode(MODE_MORPHEME) })
-            add(MenuOption("文", Color.argb(235, 40, 160, 120)) { setMode(MODE_SENTENCE_DICT) })
-            add(MenuOption("Stop", Color.argb(235, 220, 80, 60)) { stopSelf() })
+            add(MenuOption("言葉", Color.argb(235, 30, 100, 220),
+                "Word mode\nClick on the floating button to detect Japanese sentences, then click on the boxes to get the word meanings.") { setMode(MODE_MORPHEME) })
+            add(MenuOption("文", Color.argb(235, 40, 160, 120),
+                "Sentence mode\nClick on the floating button to detect Japanese sentences, then click on the boxes to get the full analysis.") { setMode(MODE_SENTENCE_DICT) })
+            add(MenuOption("訳", Color.argb(235, 150, 90, 210),
+                "Translate mode\nClick on the floating button to detect Japanese sentences, then click on the boxes to get the translations.") { setMode(MODE_TRANSLATE) })
+            add(MenuOption("Stop", Color.argb(235, 220, 80, 60),
+                "Stop\nClose the overlay and stop capturing.") { stopSelf() })
         }
 
         val scrim = FrameLayout(this).apply {
@@ -484,8 +543,35 @@ class OverlayService : Service() {
                 leftMargin = (ox - size / 2).coerceIn(margin, screenW - margin - size)
                 topMargin = (oy - size / 2).coerceIn(margin, screenH - margin - size)
             })
-            placed += RadialOption(view, opt.color, angle, opt.action)
+            placed += RadialOption(view, opt.color, angle, opt.desc, opt.action)
         }
+
+        // Hover-description label: describes the option the finger is pointing at.
+        // Shown centered in the middle of the screen (so it's noticeable and never
+        // hidden behind the floating button) — nudged a bit below centre when the
+        // button is up top, a bit above centre when the button is down low, so the
+        // button/mode glyph and this text never overlap.
+        val descW = dp(280)
+        val desc = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(10).toFloat()
+                setColor(Color.argb(235, 20, 20, 20))
+            }
+            text = "Point to a mode"
+            alpha = 0f
+        }
+        val buttonInTopHalf = cy < screenH / 2
+        val descTop = if (buttonInTopHalf) (screenH * 0.56f).toInt() else (screenH * 0.34f).toInt()
+        scrim.addView(desc, FrameLayout.LayoutParams(descW, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.TOP or Gravity.START
+            leftMargin = ((screenW - descW) / 2).coerceAtLeast(margin)
+            topMargin = descTop.coerceIn(margin, screenH - margin - dp(96))
+        })
+        radialDescView = desc
 
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -544,8 +630,13 @@ class OverlayService : Service() {
             var best = -1
             var bestDiff = Double.MAX_VALUE
             for ((i, o) in opts.withIndex()) {
-                var d = abs(touchAngle - o.angleRad)
-                if (d > PI) d = 2 * PI - d  // shortest angular distance
+                // Shortest angular distance, correct for any angle ranges: normalize
+                // the raw delta into [0, 2π) first, then fold into [0, π]. (A single
+                // `2π - d` broke when the raw delta exceeded 2π — e.g. right-edge
+                // options at 100°–260° vs atan2's −180°..180° — producing a negative
+                // "distance" that stole the selection.)
+                var d = ((touchAngle - o.angleRad) % (2 * PI) + 2 * PI) % (2 * PI)
+                if (d > PI) d = 2 * PI - d
                 if (d < bestDiff) { bestDiff = d; best = i }
             }
             best
@@ -559,6 +650,14 @@ class OverlayService : Service() {
             o.view.animate().scaleX(if (on) 1.2f else 1f).scaleY(if (on) 1.2f else 1f)
                 .setDuration(90).start()
         }
+        radialDescView?.let { dv ->
+            if (sel in opts.indices) {
+                dv.text = opts[sel].desc
+                dv.animate().alpha(1f).setDuration(90).start()
+            } else {
+                dv.animate().alpha(0f).setDuration(90).start()
+            }
+        }
         if (sel >= 0) opts[sel].view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
     }
 
@@ -566,7 +665,92 @@ class OverlayService : Service() {
         radialMenu?.let { runCatching { windowManager.removeView(it) } }
         radialMenu = null
         radialOptions = emptyList()
+        radialDescView = null
         radialSelected = -1
+    }
+
+    /** Begin watching for a big screen-content change (app/window switch). */
+    private fun startChangeWatch() {
+        changeWatchActive = true
+        frameBaseline = null
+        captureHandler?.removeCallbacks(changeWatchRunnable)
+        // Delay the first sample so our freshly-drawn boxes are composited into the
+        // mirror before we snapshot the baseline (otherwise the baseline lacks them
+        // and their appearance would look like a "change").
+        captureHandler?.postDelayed(changeWatchRunnable, 700)
+    }
+
+    private fun stopChangeWatch() {
+        changeWatchActive = false
+        frameBaseline = null
+        captureHandler?.removeCallbacks(changeWatchRunnable)
+    }
+
+    private fun sampleFrameForChange() {
+        if (!changeWatchActive) return
+        // Don't sample while capturing, or while a popup / radial menu is on screen
+        // (those overlays change the frame themselves and would cause a false clear).
+        if (isProcessing || popup != null || radialMenu != null) {
+            captureHandler?.postDelayed(changeWatchRunnable, 500)
+            return
+        }
+        var image: Image? = null
+        try {
+            image = imageReader?.acquireLatestImage()
+            if (image != null) {
+                val sig = frameSignature(image)
+                val base = frameBaseline
+                if (base == null) {
+                    frameBaseline = sig
+                } else if (signatureChanged(base, sig)) {
+                    Log.i(TAG, "Screen content changed — clearing overlays")
+                    mainHandler.post {
+                        clearMorphemeBoxes()
+                        clearSentenceBoxes()
+                    }
+                    return
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Frame-change sample failed", e)
+        } finally {
+            image?.close()
+        }
+        if (changeWatchActive) captureHandler?.postDelayed(changeWatchRunnable, 500)
+    }
+
+    /** Coarse grayscale signature: mean luma over a changeGrid×changeGrid grid. */
+    private fun frameSignature(image: Image): IntArray {
+        val plane = image.planes[0]
+        val buffer = plane.buffer
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
+        val w = image.width
+        val h = image.height
+        val g = changeGrid
+        val out = IntArray(g * g)
+        for (gy in 0 until g) {
+            val py = ((gy + 0.5f) / g * h).toInt().coerceIn(0, h - 1)
+            for (gx in 0 until g) {
+                val px = ((gx + 0.5f) / g * w).toInt().coerceIn(0, w - 1)
+                val idx = py * rowStride + px * pixelStride
+                val r = buffer.get(idx).toInt() and 0xFF
+                val gg = buffer.get(idx + 1).toInt() and 0xFF
+                val b = buffer.get(idx + 2).toInt() and 0xFF
+                out[gy * g + gx] = (r * 30 + gg * 59 + b * 11) / 100
+            }
+        }
+        return out
+    }
+
+    /** True when enough grid cells differ enough — a substantial content change. */
+    private fun signatureChanged(a: IntArray, b: IntArray): Boolean {
+        if (a.size != b.size) return true
+        var changedCells = 0
+        for (i in a.indices) if (abs(a[i] - b[i]) > changeThreshold) changedCells++
+        // Require ~35% of the screen to change so scrolling a line doesn't nuke boxes,
+        // but an app/window switch (near-total change) does.
+        return changedCells > a.size * 35 / 100
     }
 
     private fun captureAndRecognize() {
@@ -664,7 +848,7 @@ class OverlayService : Service() {
 
     /** Both sentence modes share the OCR → sentence-box pipeline; only the popup differs. */
     private fun isSentenceMode(): Boolean =
-        mode == MODE_SENTENCE_DICT
+        mode == MODE_SENTENCE_DICT || mode == MODE_TRANSLATE
 
     private fun computeMorphemeBoxes(visionText: Text): List<MorphemeBox> {
         val out = mutableListOf<MorphemeBox>()
@@ -909,6 +1093,14 @@ class OverlayService : Service() {
         else
             @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
+        // Clamp box geometry to the physical screen so interpolated boxes near the
+        // edges aren't drawn (or clipped) off-screen — same fix already in sentence mode.
+        val dm = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(dm)
+        val screenW = dm.widthPixels
+        val screenH = dm.heightPixels
+
         val padY = dp(3)
         for (b in boxes) {
             val view = View(this).apply {
@@ -920,8 +1112,17 @@ class OverlayService : Service() {
                     true
                 }
             }
+            var lx = b.left
+            var lw = b.width
+            if (lx < 0) { lw += lx; lx = 0 }
+            if (lx + lw > screenW) lw = screenW - lx
+            var ly = b.top - padY
+            var lh = b.height + padY * 2
+            if (ly < 0) { lh += ly; ly = 0 }
+            if (ly + lh > screenH) lh = screenH - ly
+            if (lw < 1 || lh < 1) continue  // fully off-screen — skip
             val params = WindowManager.LayoutParams(
-                b.width, b.height + padY * 2,
+                lw, lh,
                 type,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
@@ -929,8 +1130,8 @@ class OverlayService : Service() {
                 PixelFormat.TRANSLUCENT
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
-                x = b.left
-                y = b.top - padY
+                x = lx
+                y = ly
             }
             try {
                 windowManager.addView(view, params)
@@ -941,6 +1142,7 @@ class OverlayService : Service() {
         }
         Log.i(TAG, "Rendered ${renderedBoxes.size} morpheme boxes")
         updateOcrButtonAppearance()
+        if (renderedBoxes.isNotEmpty()) startChangeWatch()
     }
 
     private fun makeBoxDrawable(selected: Boolean): GradientDrawable = GradientDrawable().apply {
@@ -955,6 +1157,7 @@ class OverlayService : Service() {
     }
 
     private fun clearMorphemeBoxes() {
+        stopChangeWatch()
         dismissPopup()
         anchor1 = null
         anchor2 = null
@@ -1077,6 +1280,7 @@ class OverlayService : Service() {
                 LinearLayout.LayoutParams.WRAP_CONTENT))
         }
 
+        val dragHandle = makeDragHandle()
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
@@ -1084,6 +1288,10 @@ class OverlayService : Service() {
                 cornerRadius = dp(8).toFloat()
             }
             setPadding(dp(12), dp(8), dp(8), dp(8))
+            addView(dragHandle, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(2) })
             addView(headerRow, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT))
@@ -1092,9 +1300,14 @@ class OverlayService : Service() {
                 LinearLayout.LayoutParams.WRAP_CONTENT))
         }
 
+        // Once the user drags the popup, stop auto-repositioning it (otherwise it
+        // snaps back when the async detail fills in and grows the popup).
+        var userMoved = false
+
         // Re-clamp on-screen position whenever content changes size (the detail
         // arrives async and the popup grows downward).
         fun reposition() {
+            if (userMoved) return
             val wSpec = View.MeasureSpec.makeMeasureSpec(maxPopupW, View.MeasureSpec.AT_MOST)
             val hSpec = View.MeasureSpec.makeMeasureSpec(screenH, View.MeasureSpec.AT_MOST)
             container.measure(wSpec, hSpec)
@@ -1160,6 +1373,11 @@ class OverlayService : Service() {
         val holder = PopupHolder(container, titleView)
         popup = holder
 
+        // Drag to move via the handle bar or header row.
+        val onDrag = { userMoved = true }
+        attachPopupDrag(dragHandle, container, params, onDrag)
+        attachPopupDrag(headerRow, container, params, onDrag)
+
         // Look the word up off the main thread.
         Thread {
             JmDict.warmUp(this)
@@ -1190,6 +1408,59 @@ class OverlayService : Service() {
     private fun dismissPopup() {
         popup?.let { runCatching { windowManager.removeView(it.view) } }
         popup = null
+    }
+
+    /**
+     * A wide, tall drag-grip strip for the top of a popup: a thin visible bar centered
+     * inside a full-width row with generous vertical padding, so the touch target for
+     * dragging is large (a 5dp bar alone is easy to miss).
+     */
+    private fun makeDragHandle(): View {
+        val bar = View(this).apply {
+            background = GradientDrawable().apply {
+                cornerRadius = dp(2).toFloat()
+                setColor(Color.argb(160, 255, 255, 255))
+            }
+        }
+        return FrameLayout(this).apply {
+            setPadding(0, dp(11), 0, dp(11))
+            isClickable = true
+            addView(bar, FrameLayout.LayoutParams(dp(60), dp(6)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+            })
+        }
+    }
+
+    /**
+     * Makes a popup window draggable by grabbing [handle] (e.g. its header row) and
+     * moving [container]'s window. [onMove] fires on each drag step (used to suppress
+     * the async auto-reposition once the user has taken over placement).
+     */
+    private fun attachPopupDrag(
+        handle: View,
+        container: View,
+        params: WindowManager.LayoutParams,
+        onMove: () -> Unit = {},
+    ) {
+        var ix = 0
+        var iy = 0
+        var sx = 0f
+        var sy = 0f
+        handle.setOnTouchListener { _, e ->
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    ix = params.x; iy = params.y; sx = e.rawX; sy = e.rawY; true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    params.x = ix + (e.rawX - sx).toInt()
+                    params.y = iy + (e.rawY - sy).toInt()
+                    onMove()
+                    runCatching { windowManager.updateViewLayout(container, params) }
+                    true
+                }
+                else -> false
+            }
+        }
     }
 
     /** Reconstructs the natural-language text spanned by anchors a and b. */
@@ -1256,19 +1527,31 @@ class OverlayService : Service() {
             isClickable = true
             setOnClickListener { dismissPopup() }
         }
-        val container = LinearLayout(this).apply {
+        val dragHandle = makeDragHandle()
+        val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            background = GradientDrawable().apply {
-                setColor(Color.argb(235, 0, 0, 0))
-                cornerRadius = dp(8).toFloat()
-            }
-            setPadding(dp(12), dp(8), dp(8), dp(8))
             addView(textCol, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ))
             addView(closeBtn, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ))
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                setColor(Color.argb(235, 0, 0, 0))
+                cornerRadius = dp(8).toFloat()
+            }
+            setPadding(dp(12), dp(8), dp(8), dp(8))
+            addView(dragHandle, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(2) })
+            addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ))
         }
@@ -1318,6 +1601,10 @@ class OverlayService : Service() {
 
         val holder = PopupHolder(container, translationView)
         popup = holder
+
+        // Drag to move via the handle bar or the text row.
+        attachPopupDrag(dragHandle, container, params)
+        attachPopupDrag(row, container, params)
 
         Log.i(TAG, "range = \"$rangeText\"   hira = \"$readingHira\"")
 
@@ -2037,6 +2324,7 @@ class OverlayService : Service() {
         }
         Log.i(TAG, "Rendered ${renderedSentenceBoxes.size} sentence boxes")
         updateOcrButtonAppearance()
+        if (renderedSentenceBoxes.isNotEmpty()) startChangeWatch()
     }
 
     private fun makeSentenceBoxDrawable(): GradientDrawable = GradientDrawable().apply {
@@ -2049,6 +2337,7 @@ class OverlayService : Service() {
         if (renderedSentenceBoxes.isEmpty() && popup == null) {
             // popup may belong to morpheme mode; only dismiss if we own boxes
         }
+        stopChangeWatch()
         dismissPopup()
         for (rb in renderedSentenceBoxes) {
             runCatching { windowManager.removeView(rb.view) }
@@ -2059,7 +2348,39 @@ class OverlayService : Service() {
 
     private fun onSentenceClick(box: SentenceBox) {
         Log.i(TAG, "sentence tap → ${box.fullText}")
-        showDictAnalysisPopup(box)
+        if (mode == MODE_TRANSLATE) showTranslatePopup(box) else showDictAnalysisPopup(box)
+    }
+
+    /**
+     * Translation-only sentence popup (MODE_TRANSLATE). Reuses the analysis-popup
+     * scaffold but fills in nothing except the offline FuguMT translation.
+     */
+    private fun showTranslatePopup(box: SentenceBox) {
+        val ui = buildAnalysisPopup(box) ?: return
+        // Translation-only: no word-by-word section.
+        ui.wordHeader.visibility = View.GONE
+        ui.wordBody.text = "Translating…"
+
+        val sentence = box.fullText
+        Thread {
+            Translator.warmUp(this)
+            val translation = runCatching { Translator.translateJaToEn(sentence) }.getOrDefault("")
+            mainHandler.post {
+                if (popup !== ui.holder) return@post
+                ui.wordBody.visibility = View.GONE
+                if (translation.isBlank()) {
+                    ui.wordBody.visibility = View.VISIBLE
+                    ui.wordBody.text =
+                        if (Translator.isAvailable()) "(no translation)"
+                        else "Translation model not built."
+                } else {
+                    ui.transBody.text = translation
+                    ui.transHeader.visibility = View.VISIBLE
+                    ui.transBody.visibility = View.VISIBLE
+                }
+                ui.container.post { ui.reposition() }
+            }
+        }.start()
     }
 
     /**
@@ -2071,6 +2392,7 @@ class OverlayService : Service() {
     private class AnalysisPopup(
         val holder: PopupHolder,
         val container: View,
+        val wordHeader: TextView,
         val wordBody: TextView,
         val wordList: LinearLayout,
         val readingHeader: TextView,
@@ -2236,12 +2558,7 @@ class OverlayService : Service() {
 
         // A small white grab bar centered at the top to signal the popup is draggable.
         // It (and the header row) move the popup — see the touch listener below.
-        val dragHandle = View(this).apply {
-            background = GradientDrawable().apply {
-                cornerRadius = dp(2).toFloat()
-                setColor(Color.argb(150, 255, 255, 255))
-            }
-        }
+        val dragHandle = makeDragHandle()
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
@@ -2249,10 +2566,10 @@ class OverlayService : Service() {
                 cornerRadius = dp(8).toFloat()
             }
             setPadding(dp(12), dp(8), dp(8), dp(8))
-            addView(dragHandle, LinearLayout.LayoutParams(dp(40), dp(5)).apply {
-                gravity = Gravity.CENTER_HORIZONTAL
-                bottomMargin = dp(6)
-            })
+            addView(dragHandle, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(2) })
             // MATCH_PARENT here so the header row stretches to the popup's
             // natural width (determined by the scroll content), letting the
             // title's weight=1 push the ✕ to the right edge.
@@ -2370,6 +2687,7 @@ class OverlayService : Service() {
         return AnalysisPopup(
             holder = holder,
             container = container,
+            wordHeader = wordHeader,
             wordBody = wordBody,
             wordList = wordList,
             readingHeader = readingHeader,
