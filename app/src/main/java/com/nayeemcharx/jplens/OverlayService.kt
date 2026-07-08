@@ -2,6 +2,8 @@ package com.nayeemcharx.jplens
 
 import android.animation.ValueAnimator
 import android.app.Notification
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -1252,8 +1254,12 @@ class OverlayService : Service() {
         }
         val headerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             addView(titleView, LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(makeCopyIcon { m.base }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT))
             addView(closeBtn, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT))
@@ -1408,6 +1414,40 @@ class OverlayService : Service() {
     private fun dismissPopup() {
         popup?.let { runCatching { windowManager.removeView(it.view) } }
         popup = null
+    }
+
+    /**
+     * A small "⧉" copy icon for a popup header. On tap it copies [text] to the
+     * clipboard and briefly flashes a green ✓ (with a little scale pop) before
+     * reverting. Used only for the main word/sentence — not the detail sections.
+     */
+    private fun makeCopyIcon(text: () -> CharSequence?): TextView {
+        val idleColor = Color.argb(255, 200, 220, 255)
+        val icon = TextView(this).apply {
+            this.text = "⧉"
+            setTextColor(idleColor)
+            textSize = 16f
+            setPadding(dp(8), dp(2), dp(8), dp(2))
+            isClickable = true
+            isFocusable = false
+            contentDescription = "Copy"
+        }
+        icon.setOnClickListener {
+            val out = text()?.toString()
+            if (out.isNullOrEmpty()) return@setOnClickListener
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("JP Lens", out))
+            icon.text = "✓"
+            icon.setTextColor(Color.argb(255, 90, 220, 120))
+            icon.animate().scaleX(1.35f).scaleY(1.35f).setDuration(120)
+                .withEndAction { icon.animate().scaleX(1f).scaleY(1f).setDuration(120).start() }
+                .start()
+            mainHandler.postDelayed({
+                icon.text = "⧉"
+                icon.setTextColor(idleColor)
+            }, 1000)
+        }
+        return icon
     }
 
     /**
@@ -2442,12 +2482,22 @@ class OverlayService : Service() {
             isClickable = true
             setOnClickListener { dismissPopup() }
         }
+        // Translate mode shows only the translation — no Japanese source title and
+        // no copy icon (the sentence is offscreen content, not what the user wants).
+        val translateMode = mode == MODE_TRANSLATE
+        // Keep the (now empty) title as a weighted spacer so ✕ stays on the right.
+        if (translateMode) titleView.text = ""
         val headerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             addView(titleView, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 1f
+            ))
+            if (!translateMode) addView(makeCopyIcon { box.fullText }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
             ))
             addView(closeBtn, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,

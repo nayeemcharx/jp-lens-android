@@ -255,7 +255,7 @@ fun PermissionFlow(
                 putExtra(OverlayService.EXTRA_MODE, pendingMode)
             }
             ContextCompat.startForegroundService(context, svc)
-            status = "Overlay running — tap the floating button to capture; hold it to switch mode or stop."
+            status = "JP Lens started — tap the floating button to capture text. hold it to switch mode or stop."
         } else {
             status = "Screen-capture permission denied."
         }
@@ -387,10 +387,18 @@ fun PermissionFlow(
         ) { Text("Stop") }
 
         if (status.isNotBlank()) {
-            Text(status, style = MaterialTheme.typography.bodyMedium)
+            val running = status.startsWith("JP Lens started")
+            Text(
+                status,
+                style = if (running) MaterialTheme.typography.titleMedium
+                        else MaterialTheme.typography.bodyMedium,
+                fontWeight = if (running) FontWeight.Bold else null,
+                color = if (running) OK_COLOR else Color.Unspecified,
+            )
         }
-        Hint("Tip: hold the floating button to switch mode or stop without reopening this screen.")
-        Hint("Tip: manga panels that mix horizontal & vertical text can throw off OCR — if detection looks off, just zoom in on the panel and try again :)")
+        Hint("Note: offline translation isn't perfect, but it's usually enough to get the meaning across. A future release may add an opt-in for online translation APIs.")
+        Hint("Note: OCR capture quality depends entirely on your device's built-in OCR engine.")
+        Hint("Tip: manga panels can sometimes mix up alignments or fail to detect text — if detection looks off, zoom in on the panel and try again. It might give a better result :)")
 
         TextButton(onClick = onAbout, modifier = Modifier.fillMaxWidth()) {
             Text("About & privacy")
