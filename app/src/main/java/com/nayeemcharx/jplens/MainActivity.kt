@@ -33,6 +33,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -127,6 +128,18 @@ private fun StatusLine(ok: Boolean, text: String) {
     }
 }
 
+/** A label + switch row for the popup-section toggles. */
+@Composable
+private fun ToggleLine(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Text(label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+        Switch(checked = checked, onCheckedChange = onChange)
+    }
+}
+
 /** Small muted helper/hint text. */
 @Composable
 private fun Hint(text: String) {
@@ -206,6 +219,17 @@ fun PermissionFlow(
         mutableStateOf(prefs.getString(OverlayService.PREF_ANKI_DECK, "JP Lens") ?: "JP Lens")
     }
 
+    // Which sections the sentence popup shows (read live by OverlayService on each tap).
+    var showReading by remember {
+        mutableStateOf(prefs.getBoolean(OverlayService.PREF_SHOW_READING, true))
+    }
+    var showTranslation by remember {
+        mutableStateOf(prefs.getBoolean(OverlayService.PREF_SHOW_TRANSLATION, true))
+    }
+    var showDictionary by remember {
+        mutableStateOf(prefs.getBoolean(OverlayService.PREF_SHOW_DICTIONARY, true))
+    }
+
     // Re-read on each resume so returning from settings reflects the new state.
     val overlayOk = remember(resumeTick) { Settings.canDrawOverlays(context) }
     val notifOk = remember(resumeTick) {
@@ -242,7 +266,7 @@ fun PermissionFlow(
     val projectionManager = remember {
         context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
     }
-    var pendingMode by remember { mutableStateOf(OverlayService.MODE_MORPHEME) }
+    var pendingMode by remember { mutableStateOf(OverlayService.MODE_SENTENCE_DICT) }
 
     val projectionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -295,7 +319,7 @@ fun PermissionFlow(
             return
         }
         // Resume the last mode used; switchable live via the floating button's hold menu.
-        pendingMode = prefs.getInt(OverlayService.PREF_LAST_MODE, OverlayService.MODE_MORPHEME)
+        pendingMode = prefs.getInt(OverlayService.PREF_LAST_MODE, OverlayService.MODE_SENTENCE_DICT)
         projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
     }
 
@@ -329,12 +353,29 @@ fun PermissionFlow(
             Hint("Screen-capture access is requested each time you press Start (system prompt).")
         }
 
+        // ── Popup sections ───────────────────────────────────────────
+        SectionCard("2 · Popup sections") {
+            Hint("Choose what appears when you tap a detected sentence.")
+            ToggleLine("Reading (kana)", showReading) {
+                showReading = it
+                prefs.edit().putBoolean(OverlayService.PREF_SHOW_READING, it).apply()
+            }
+            ToggleLine("Translation", showTranslation) {
+                showTranslation = it
+                prefs.edit().putBoolean(OverlayService.PREF_SHOW_TRANSLATION, it).apply()
+            }
+            ToggleLine("Dictionary (word-by-word)", showDictionary) {
+                showDictionary = it
+                prefs.edit().putBoolean(OverlayService.PREF_SHOW_DICTIONARY, it).apply()
+            }
+        }
+
         // ── Offline translation model ────────────────────────────────
-        SectionCard("2 · Offline translation") {
+        SectionCard("3 · Offline translation") {
             when (modelState) {
                 "present" -> {
                     StatusLine(true, "FuguMT translation model bundled — works fully offline, on-device.")
-                    Hint("Used for full-sentence translation in dict mode and range translation in word mode.")
+                    Hint("Used for the popup's Translation section.")
                 }
                 "missing" -> {
                     StatusLine(false, "Translation model not built into this APK.")
@@ -345,7 +386,7 @@ fun PermissionFlow(
         }
 
         // ── AnkiDroid ────────────────────────────────────────────────
-        SectionCard("3 · Add to AnkiDroid (optional)") {
+        SectionCard("4 · Add to AnkiDroid (optional)") {
             EditableField(
                 label = "Deck name",
                 value = deckName,

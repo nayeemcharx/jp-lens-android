@@ -67,18 +67,22 @@ class OverlayService : Service() {
         const val EXTRA_RESULT_DATA = "result_data"
         const val EXTRA_MODE = "mode"
 
-        const val MODE_MORPHEME = 0
-        // (1 was the former LLM sentence mode, removed.)
+        // (0 was word/morpheme mode, 1 the LLM sentence mode, 3 the translate-only
+        // sentence mode — all removed; their integer ids are unused.)
         const val MODE_SENTENCE_DICT = 2
-        // Translation-only sentence mode: same OCR/sentence pipeline as dict mode,
-        // but tapping a sentence shows only its offline FuguMT translation.
-        const val MODE_TRANSLATE = 3
+        // Crop mode: same sentence pipeline, but the user first drags a rectangle
+        // over a frozen snapshot and only that region is sent to OCR.
+        const val MODE_CROP = 4
 
         const val PREFS_NAME = "jp_lens"
         // AnkiDroid deck name the "+" button adds cards to (set on the home screen).
         const val PREF_ANKI_DECK = "anki_deck_name"
         // Last capture mode chosen (start button resumes it; radial menu updates it).
         const val PREF_LAST_MODE = "last_mode"
+        // Sentence-popup section toggles (set on the home screen; all default on).
+        const val PREF_SHOW_READING = "show_reading"
+        const val PREF_SHOW_TRANSLATION = "show_translation"
+        const val PREF_SHOW_DICTIONARY = "show_dictionary"
 
         // How long to hold the floating button before the radial mode menu appears.
         // Short (standard long-press); a drag past touchSlop cancels it, so a brief
@@ -126,24 +130,12 @@ class OverlayService : Service() {
     // Set by the analysis popup's drag handler; suppresses auto-reposition so a
     // user-positioned popup doesn't jump when its content fills in.
     private var userMovedPopup = false
+    // Popup requests load their data BEFORE the popup is shown; this token (main
+    // thread only) lets a newer tap — or a dismissed/cleared overlay — supersede
+    // an older lookup that's still in flight, so a stale popup can't appear.
+    private var popupRequestSeq = 0
 
-    private data class MorphemeBox(
-        val left: Int,
-        val top: Int,
-        val width: Int,
-        val height: Int,
-        val morpheme: JapaneseTokenizer.Morpheme,
-        val seq: Int,           // global reading-order sequence number
-        val lineKey: Int,       // unique id for the line this morpheme came from
-        val lineText: String,   // full text of that line (rebuilt from elements)
-        val charStart: Int,     // char offset of surface within lineText
-        val charEnd: Int,       // exclusive
-    )
-
-    private data class RenderedBox(val view: View, val box: MorphemeBox)
-    private val renderedBoxes = mutableListOf<RenderedBox>()
-
-    // Sentence-mode overlays (MODE_SENTENCE_DICT).
+    // Sentence-mode overlays (MODE_SENTENCE_DICT / MODE_CROP).
     private data class SentenceBox(
         val left: Int,
         val top: Int,
@@ -155,12 +147,11 @@ class OverlayService : Service() {
     private data class RenderedSentenceBox(val view: View, val box: SentenceBox)
     private val renderedSentenceBoxes = mutableListOf<RenderedSentenceBox>()
 
-    private var mode: Int = MODE_MORPHEME
+    private var mode: Int = MODE_SENTENCE_DICT
 
-    // Range-selection state: two long-press anchors. Both null = IDLE,
-    // anchor1 only = ANCHORED, both set = RANGE.
-    private var anchor1: MorphemeBox? = null
-    private var anchor2: MorphemeBox? = null
+    // Fullscreen crop-selection overlay (MODE_CROP): shows the frozen snapshot;
+    // the user drags a rectangle and only that region is OCR'd.
+    private var cropSelector: View? = null
 
     private val recognizer by lazy {
         TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())
@@ -195,11 +186,15 @@ class OverlayService : Service() {
     private fun handleStart(intent: Intent) {
         startForegroundCompat()
 
-        // A fresh capture session always starts in sentence-dict (文) mode,
-        // regardless of the last-used mode; the radial menu switches live after.
+        // A restart while a crop selection was pending would leave the button
+        // hidden and isProcessing stuck — drop the stale selector first.
+        cancelCropSelector()
+
+        // A fresh capture session always starts in sentence (文) mode, regardless
+        // of the last-used mode; the radial menu switches live after.
         mode = MODE_SENTENCE_DICT
         persistMode()
-        Log.i(TAG, "Starting mode=$mode (0=morpheme, 2=sentence+JMdict, 3=translate)")
+        Log.i(TAG, "Starting mode=$mode (2=sentence, 4=crop)")
 
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
         val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -228,9 +223,9 @@ class OverlayService : Service() {
             JapaneseTokenizer.warmUp(this)
             Log.i(TAG, "Sudachi warm-up: ${System.currentTimeMillis() - t0} ms (available=${JapaneseTokenizer.isAvailable()})")
         }
-        // Both modes use the offline JMdict SQLite asset (dict mode for word-by-word;
-        // morpheme mode for the single-tap detail popup) and the offline FuguMT
-        // translator (dict full-sentence / morpheme range), so warm both up front.
+        // Both modes use the offline JMdict SQLite asset (word-by-word section)
+        // and the offline FuguMT translator (Translation section), so warm both
+        // up front.
         captureHandler?.post {
             val t0 = System.currentTimeMillis()
             JmDict.warmUp(this)
@@ -312,12 +307,13 @@ class OverlayService : Service() {
 
     private fun updateOcrButtonAppearance() {
         val btn = floatingView as? Button ?: return
-        val active = renderedBoxes.isNotEmpty() || renderedSentenceBoxes.isNotEmpty()
+        // "Active" (tap clears) when boxes are showing, or when a crop-mode popup
+        // is open without boxes.
+        val active = renderedSentenceBoxes.isNotEmpty() || popup != null
         btn.text = when {
             active -> "✕"
-            mode == MODE_SENTENCE_DICT -> "文"
-            mode == MODE_TRANSLATE -> "訳"
-            else -> "言葉"
+            mode == MODE_CROP -> "✂"
+            else -> "文"
         }
         btn.background = GradientDrawable().apply {
             if (active) {
@@ -328,9 +324,8 @@ class OverlayService : Service() {
                 shape = GradientDrawable.OVAL
                 setColor(
                     when (mode) {
-                        MODE_SENTENCE_DICT -> Color.argb(220, 40, 160, 120)
-                        MODE_TRANSLATE -> Color.argb(220, 150, 90, 210)
-                        else -> Color.argb(220, 30, 100, 220)
+                        MODE_CROP -> Color.argb(220, 230, 140, 40)
+                        else -> Color.argb(220, 40, 160, 120)
                     }
                 )
             }
@@ -445,22 +440,17 @@ class OverlayService : Service() {
      */
     private fun setMode(newMode: Int) {
         if (newMode == mode) return
-        clearMorphemeBoxes()
         clearSentenceBoxes()
         mode = newMode
         persistMode()
         // Both modes look words up in JMdict and use the offline FuguMT translator
-        // (dict full-sentence / morpheme range popups).
+        // for the popup sections.
         captureHandler?.post {
             JmDict.warmUp(this)
             Translator.warmUp(this)
         }
         updateOcrButtonAppearance()
-        val name = when (newMode) {
-            MODE_SENTENCE_DICT -> "JMdict sentence"
-            MODE_TRANSLATE -> "translation"
-            else -> "word"
-        }
+        val name = if (newMode == MODE_CROP) "crop" else "sentence"
         Toast.makeText(this, "Mode: $name", Toast.LENGTH_SHORT).show()
     }
 
@@ -501,12 +491,10 @@ class OverlayService : Service() {
         val screenH = metrics.heightPixels
 
         val options = buildList {
-            add(MenuOption("言葉", Color.argb(235, 30, 100, 220),
-                "Word mode\nClick on the floating button to detect Japanese sentences, then click on the boxes to get the word meanings.") { setMode(MODE_MORPHEME) })
             add(MenuOption("文", Color.argb(235, 40, 160, 120),
                 "Sentence mode\nClick on the floating button to detect Japanese sentences, then click on the boxes to get the full analysis.") { setMode(MODE_SENTENCE_DICT) })
-            add(MenuOption("訳", Color.argb(235, 150, 90, 210),
-                "Translate mode\nClick on the floating button to detect Japanese sentences, then click on the boxes to get the translations.") { setMode(MODE_TRANSLATE) })
+            add(MenuOption("✂", Color.argb(235, 230, 140, 40),
+                "Crop mode\nClick on the floating button, then drag a box over the area you want — only that area is scanned for Japanese text.") { setMode(MODE_CROP) })
             add(MenuOption("Stop", Color.argb(235, 220, 80, 60),
                 "Stop\nClose the overlay and stop capturing.") { stopSelf() })
         }
@@ -690,9 +678,10 @@ class OverlayService : Service() {
 
     private fun sampleFrameForChange() {
         if (!changeWatchActive) return
-        // Don't sample while capturing, or while a popup / radial menu is on screen
-        // (those overlays change the frame themselves and would cause a false clear).
-        if (isProcessing || popup != null || radialMenu != null) {
+        // Don't sample while capturing, or while a popup / radial menu / crop
+        // selector is on screen (those overlays change the frame themselves and
+        // would cause a false clear).
+        if (isProcessing || popup != null || radialMenu != null || cropSelector != null) {
             captureHandler?.postDelayed(changeWatchRunnable, 500)
             return
         }
@@ -706,10 +695,7 @@ class OverlayService : Service() {
                     frameBaseline = sig
                 } else if (signatureChanged(base, sig)) {
                     Log.i(TAG, "Screen content changed — clearing overlays")
-                    mainHandler.post {
-                        clearMorphemeBoxes()
-                        clearSentenceBoxes()
-                    }
+                    mainHandler.post { clearSentenceBoxes() }
                     return
                 }
             }
@@ -756,34 +742,54 @@ class OverlayService : Service() {
     }
 
     private fun captureAndRecognize() {
-        // Toggle: if any overlay is showing, just clear it.
-        if (renderedBoxes.isNotEmpty() || renderedSentenceBoxes.isNotEmpty()) {
-            clearMorphemeBoxes()
+        // Toggle: if any overlay is showing, just clear it. (A crop-mode popup has
+        // no boxes, so check it separately — it must also be gone before the next
+        // snapshot, or it would be captured into it.)
+        if (renderedSentenceBoxes.isNotEmpty()) {
             clearSentenceBoxes()
             return
         }
-        if (isProcessing) return
+        if (popup != null) {
+            dismissPopup()
+            return
+        }
+        if (isProcessing || cropSelector != null) return
         val reader = imageReader ?: return
+        // A new capture supersedes any popup lookup still in flight — otherwise a
+        // stale popup could surface on top of the new snapshot/selector.
+        popupRequestSeq++
         isProcessing = true
         // Hide the button so it isn't captured, then capture next frame.
         floatingView?.visibility = View.INVISIBLE
 
         captureHandler?.postDelayed({
             var image: Image? = null
+            // In crop mode the snapshot is handed to the crop selector, which keeps
+            // the button hidden and isProcessing set until the user commits/cancels;
+            // otherwise OCR takes over and resets isProcessing from its listeners.
+            var handedOff = false
             try {
                 image = reader.acquireLatestImage()
                 if (image == null) {
                     Log.w(TAG, "No image available")
-                    return@postDelayed
+                } else {
+                    val bitmap = imageToBitmap(image)
+                    if (mode == MODE_CROP) {
+                        handedOff = true
+                        mainHandler.post { showCropSelector(bitmap) }
+                    } else {
+                        runOcr(bitmap)
+                        handedOff = true
+                        mainHandler.post { floatingView?.visibility = View.VISIBLE }
+                    }
                 }
-                val bitmap = imageToBitmap(image)
-                runOcr(bitmap)
             } catch (e: Exception) {
                 Log.e(TAG, "Capture failed", e)
             } finally {
                 image?.close()
-                Handler(mainLooper).post {
-                    floatingView?.visibility = View.VISIBLE
+                if (!handedOff) {
+                    isProcessing = false
+                    mainHandler.post { floatingView?.visibility = View.VISIBLE }
                 }
             }
         }, 120)
@@ -806,6 +812,7 @@ class OverlayService : Service() {
         return Bitmap.createBitmap(bitmap, 0, 0, image.width, image.height)
     }
 
+    /** Sentence mode: OCR the full screen and overlay clickable sentence boxes. */
     private fun runOcr(bitmap: Bitmap) {
         val input = InputImage.fromBitmap(bitmap, 0)
         recognizer.process(input)
@@ -814,6 +821,7 @@ class OverlayService : Service() {
                 if (result.text.isBlank()) {
                     Log.i(TAG, "(no text)")
                     Log.i(TAG, "────────────────")
+                    Toast.makeText(this, "No Japanese text found", Toast.LENGTH_SHORT).show()
                     isProcessing = false
                     return@addOnSuccessListener
                 }
@@ -821,24 +829,15 @@ class OverlayService : Service() {
                     Log.i(TAG, "[block] ${block.text.replace("\n", " / ")}")
                 }
                 Log.i(TAG, "[full]\n${result.text}")
-                if (isSentenceMode()) {
-                    captureHandler?.post {
-                        val sboxes = computeSentenceBoxes(result)
-                        Log.i(TAG, "Sentence boxes: ${sboxes.size}")
-                        mainHandler.post {
-                            renderSentenceBoxes(sboxes)
-                            isProcessing = false
+                captureHandler?.post {
+                    val sboxes = computeSentenceBoxes(result)
+                    Log.i(TAG, "Sentence boxes: ${sboxes.size}")
+                    mainHandler.post {
+                        if (sboxes.isEmpty()) {
+                            Toast.makeText(this, "No Japanese text found", Toast.LENGTH_SHORT).show()
                         }
-                    }
-                } else {
-                    // Tokenize off the main thread — first call loads ~7MB dictionary.
-                    captureHandler?.post {
-                        val boxes = computeMorphemeBoxes(result)
-                        logMorphemes(boxes)
-                        mainHandler.post {
-                            renderMorphemeBoxes(boxes)
-                            isProcessing = false
-                        }
+                        renderSentenceBoxes(sboxes)
+                        isProcessing = false
                     }
                 }
             }
@@ -848,29 +847,282 @@ class OverlayService : Service() {
             }
     }
 
-    /** Both sentence modes share the OCR → sentence-box pipeline; only the popup differs. */
-    private fun isSentenceMode(): Boolean =
-        mode == MODE_SENTENCE_DICT || mode == MODE_TRANSLATE
+    // ───────────────────────── Crop mode ─────────────────────────
 
-    private fun computeMorphemeBoxes(visionText: Text): List<MorphemeBox> {
-        val out = mutableListOf<MorphemeBox>()
-        var seq = 0
-        var lineKey = 0
-        for (block in visionText.textBlocks) {
-            // Reorder lines for reading order: vertical Japanese reads columns right-to-left.
-            val orderedLines = if (isBlockVertical(block)) {
-                block.lines.sortedByDescending { it.boundingBox?.centerX() ?: 0 }
-            } else {
-                block.lines
+    /**
+     * Crop mode: OCR the cropped region and — instead of rendering boxes — open
+     * the analysis popup directly with **all** the Japanese text found in the
+     * crop, assembled in reading order (vertical blocks read right-to-left,
+     * columns top-to-bottom). Blocks with no Japanese at all are dropped, but a
+     * Japanese block keeps its digits/Latin fragments intact.
+     */
+    private fun runCropOcr(bitmap: Bitmap, cropRect: android.graphics.Rect) {
+        val input = InputImage.fromBitmap(bitmap, 0)
+        recognizer.process(input)
+            .addOnSuccessListener { result ->
+                val text = assembleCropText(result)
+                Log.i(TAG, "Crop OCR text → \"$text\"")
+                isProcessing = false
+                if (text.isEmpty()) {
+                    Toast.makeText(this, "No Japanese text found in the selection", Toast.LENGTH_SHORT).show()
+                } else {
+                    showDictAnalysisPopup(text, cropRect)
+                }
             }
+            .addOnFailureListener { e ->
+                Log.e(TAG, "Crop OCR failed", e)
+                isProcessing = false
+            }
+    }
+
+    /**
+     * Joins the OCR result into one string in reading order. Within a vertical
+     * (tategaki) block, lines are sorted right-to-left; line text is rebuilt
+     * from elements (see [buildLineRanges]). Blocks containing no Japanese
+     * characters are skipped entirely.
+     *
+     * Block order: ML Kit emits blocks roughly left-to-right / top-to-bottom,
+     * which scrambles multi-column vertical text that it split into several
+     * blocks (a manga bubble can come out left column → right → middle). So
+     * when the crop is predominantly vertical, the blocks themselves are
+     * re-sorted right-to-left (ties top-to-bottom) — proper tategaki reading
+     * order. Horizontal crops keep ML Kit's order.
+     */
+    private fun assembleCropText(result: Text): String {
+        data class BlockPiece(val text: String, val box: android.graphics.Rect?, val vertical: Boolean)
+
+        val pieces = ArrayList<BlockPiece>()
+        for (block in result.textBlocks) {
+            val vert = isBlockVertical(block)
+            val orderedLines = if (vert) {
+                block.lines.sortedByDescending { it.boundingBox?.centerX() ?: 0 }
+            } else block.lines
+            val blockText = StringBuilder()
             for (line in orderedLines) {
-                val lineBoxes = morphemeBoxesForLine(line, seq, lineKey)
-                out += lineBoxes
-                seq += lineBoxes.size
-                lineKey++
+                val (lineText, _) = buildLineRanges(line, isLineVertical(line))
+                blockText.append(lineText)
+            }
+            if (JapaneseTokenizer.containsJapanese(blockText.toString())) {
+                pieces += BlockPiece(blockText.toString(), block.boundingBox, vert)
             }
         }
-        return out
+
+        val verticalMajority = pieces.count { it.vertical } * 2 > pieces.size
+        val ordered = if (verticalMajority) {
+            pieces.sortedWith(
+                compareByDescending<BlockPiece> { it.box?.centerX() ?: 0 }
+                    .thenBy { it.box?.top ?: 0 }
+            )
+        } else pieces
+
+        val sb = StringBuilder()
+        for (p in ordered) {
+            // Space between distinct blocks (speech bubbles, panels) so their
+            // edge words don't fuse; lines *within* a block join directly
+            // because they're usually one wrapped sentence.
+            if (sb.isNotEmpty()) sb.append(' ')
+            sb.append(p.text)
+        }
+        return sb.toString().trim()
+    }
+
+    /**
+     * Fullscreen crop selector (MODE_CROP): shows the frozen [bitmap] snapshot,
+     * dims it, and lets the user drag a rectangle; releasing sends only that
+     * region to OCR ([runCropOcr]), which opens the analysis popup directly with
+     * all the text found — no intermediate boxes. The floating button stays
+     * hidden and [isProcessing] stays true until the user commits or cancels,
+     * so a stray button tap can't start a second capture.
+     */
+    private fun showCropSelector(bitmap: Bitmap) {
+        if (cropSelector != null) return
+
+        val dimPaint = android.graphics.Paint().apply { color = Color.argb(110, 0, 0, 0) }
+        val borderPaint = android.graphics.Paint().apply {
+            style = android.graphics.Paint.Style.STROKE
+            strokeWidth = dp(2).toFloat()
+            color = Color.argb(255, 230, 140, 40)
+        }
+
+        var selecting = false
+        var startX = 0f
+        var startY = 0f
+        var curX = 0f
+        var curY = 0f
+
+        // Dim everything except the live selection (four rects around it) — no
+        // xfermode/layer tricks needed.
+        val selection = object : View(this) {
+            override fun onDraw(canvas: android.graphics.Canvas) {
+                val w = width.toFloat()
+                val h = height.toFloat()
+                if (!selecting) {
+                    canvas.drawRect(0f, 0f, w, h, dimPaint)
+                    return
+                }
+                val l = min(startX, curX)
+                val r = max(startX, curX)
+                val t = min(startY, curY)
+                val b = max(startY, curY)
+                canvas.drawRect(0f, 0f, w, t, dimPaint)
+                canvas.drawRect(0f, t, l, b, dimPaint)
+                canvas.drawRect(r, t, w, b, dimPaint)
+                canvas.drawRect(0f, b, w, h, dimPaint)
+                canvas.drawRect(l, t, r, b, borderPaint)
+            }
+        }
+
+        val hint = TextView(this).apply {
+            text = "Drag to select the area to scan"
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(10).toFloat()
+                setColor(Color.argb(235, 20, 20, 20))
+            }
+        }
+        val cancelBtn = TextView(this).apply {
+            text = "✕"
+            setTextColor(Color.WHITE)
+            textSize = 18f
+            gravity = Gravity.CENTER
+            isClickable = true
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.argb(235, 220, 80, 60))
+            }
+            contentDescription = "Cancel crop"
+            setOnClickListener { cancelCropSelector() }
+        }
+
+        val frame = FrameLayout(this).apply {
+            addView(android.widget.ImageView(this@OverlayService).apply {
+                setImageBitmap(bitmap)
+                // The bitmap is exactly screen-sized; stretch-fit keeps 1:1 pixels.
+                scaleType = android.widget.ImageView.ScaleType.FIT_XY
+            }, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT))
+            addView(selection, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT))
+            addView(hint, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                topMargin = dp(48)
+            })
+            addView(cancelBtn, FrameLayout.LayoutParams(dp(40), dp(40)).apply {
+                gravity = Gravity.TOP or Gravity.END
+                topMargin = dp(44)
+                rightMargin = dp(16)
+            })
+        }
+
+        selection.setOnTouchListener { v, e ->
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    selecting = true
+                    startX = e.x
+                    startY = e.y
+                    curX = e.x
+                    curY = e.y
+                    hint.visibility = View.GONE
+                    selection.invalidate()
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    curX = e.x
+                    curY = e.y
+                    selection.invalidate()
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    curX = e.x
+                    curY = e.y
+                    // Map view-local coords to snapshot pixels (the window normally
+                    // sits at the physical origin, but add its actual offset in case
+                    // the system inset it).
+                    val loc = IntArray(2)
+                    v.getLocationOnScreen(loc)
+                    val l = (min(startX, curX).toInt() + loc[0]).coerceIn(0, bitmap.width - 1)
+                    val t = (min(startY, curY).toInt() + loc[1]).coerceIn(0, bitmap.height - 1)
+                    val r = (max(startX, curX).toInt() + loc[0]).coerceIn(l + 1, bitmap.width)
+                    val b = (max(startY, curY).toInt() + loc[1]).coerceIn(t + 1, bitmap.height)
+                    if (r - l < dp(24) || b - t < dp(24)) {
+                        // Too small to be a deliberate selection — let the user retry.
+                        selecting = false
+                        hint.visibility = View.VISIBLE
+                        selection.invalidate()
+                    } else {
+                        dismissCropSelector()
+                        floatingView?.visibility = View.VISIBLE
+                        captureHandler?.post {
+                            try {
+                                val cropped = Bitmap.createBitmap(bitmap, l, t, r - l, b - t)
+                                Log.i(TAG, "Crop OCR: ($l,$t) ${r - l}x${b - t}")
+                                runCropOcr(cropped, android.graphics.Rect(l, t, r, b))
+                            } catch (ex: Exception) {
+                                Log.e(TAG, "Crop OCR failed", ex)
+                                isProcessing = false
+                            }
+                        }
+                    }
+                    true
+                }
+                else -> false
+            }
+        }
+
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(metrics)
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else
+            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+        // Sized to the real metrics at the physical origin (IN_SCREEN + NO_LIMITS)
+        // so view coordinates line up 1:1 with the snapshot's OCR pixel coords.
+        val params = WindowManager.LayoutParams(
+            metrics.widthPixels, metrics.heightPixels,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+
+        try {
+            windowManager.addView(frame, params)
+            cropSelector = frame
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to add crop selector", e)
+            isProcessing = false
+            floatingView?.visibility = View.VISIBLE
+        }
+    }
+
+    /** Cancels a pending crop selection: removes the overlay and re-enables capture. */
+    private fun cancelCropSelector() {
+        if (cropSelector == null) return
+        dismissCropSelector()
+        isProcessing = false
+        floatingView?.visibility = View.VISIBLE
+    }
+
+    private fun dismissCropSelector() {
+        cropSelector?.let { runCatching { windowManager.removeView(it) } }
+        cropSelector = null
     }
 
     private fun isBlockVertical(block: Text.TextBlock): Boolean {
@@ -882,176 +1134,6 @@ class OverlayService : Service() {
             if (box.height() > box.width()) v++ else h++
         }
         return v > h
-    }
-
-    /**
-     * Per-element interpolation. We rebuild the line text from elements so the
-     * Kuromoji character offsets line up exactly with the elements that own them,
-     * then locate each morpheme's pixel rect inside the tight element boxes
-     * rather than the looser line box.
-     */
-    private fun morphemeBoxesForLine(line: Text.Line, seqStart: Int, lineKey: Int): List<MorphemeBox> {
-        return if (isLineVertical(line)) verticalLineBoxes(line, seqStart, lineKey)
-        else horizontalLineBoxes(line, seqStart, lineKey)
-    }
-
-    /**
-     * Vertical Japanese (tategaki). Build the line text from element.text (visible
-     * chars only — line.text can have hidden separators that throw off char-to-pixel
-     * mapping). Sort elements top-to-bottom by box.top first; ML Kit doesn't
-     * guarantee element reading order for vertical lines. Then interpolate per
-     * element along the Y-axis, just like horizontal does along X.
-     */
-    private fun verticalLineBoxes(line: Text.Line, seqStart: Int, lineKey: Int): List<MorphemeBox> {
-        val elements = line.elements
-        if (elements.isEmpty()) return emptyList()
-
-        val sorted = elements.sortedBy { it.boundingBox?.top ?: Int.MAX_VALUE }
-
-        val sb = StringBuilder()
-        data class ElementRange(val box: android.graphics.Rect, val start: Int, val end: Int)
-        val ranges = ArrayList<ElementRange>(sorted.size)
-        for (e in sorted) {
-            val eBox = e.boundingBox ?: continue
-            val s = sb.length
-            sb.append(e.text)
-            ranges += ElementRange(eBox, s, sb.length)
-        }
-        val lineText = sb.toString()
-        if (lineText.isEmpty()) return emptyList()
-
-        val morphemes = try {
-            JapaneseTokenizer.extract(lineText)
-        } catch (e: Exception) {
-            Log.e(TAG, "Tokenize failed (vertical)", e)
-            return emptyList()
-        }
-
-        val result = ArrayList<MorphemeBox>(morphemes.size)
-        for (m in morphemes) {
-            var left = Int.MAX_VALUE
-            var top = Int.MAX_VALUE
-            var right = Int.MIN_VALUE
-            var bottom = Int.MIN_VALUE
-
-            for (r in ranges) {
-                val overlapStart = max(r.start, m.start)
-                val overlapEnd = min(r.end, m.end)
-                if (overlapEnd <= overlapStart) continue
-
-                val eLen = (r.end - r.start).coerceAtLeast(1)
-                val charH = r.box.height().toFloat() / eLen
-                val t = r.box.top + ((overlapStart - r.start) * charH).toInt()
-                val b = r.box.top + ((overlapEnd - r.start) * charH).toInt()
-
-                if (r.box.left < left) left = r.box.left
-                if (r.box.right > right) right = r.box.right
-                if (t < top) top = t
-                if (b > bottom) bottom = b
-            }
-
-            // Fallback to line-level interpolation if no element overlapped.
-            if (left == Int.MAX_VALUE) {
-                val lb = line.boundingBox ?: continue
-                val charH = lb.height().toFloat() / max(lineText.length, 1)
-                left = lb.left
-                right = lb.right
-                top = lb.top + (m.start * charH).toInt()
-                bottom = lb.top + (m.end * charH).toInt()
-            }
-
-            val width = max(right - left, 1)
-            val height = max(bottom - top, 1)
-            result += MorphemeBox(
-                left = left,
-                top = top,
-                width = width,
-                height = height,
-                morpheme = m,
-                seq = seqStart + result.size,
-                lineKey = lineKey,
-                lineText = lineText,
-                charStart = m.start,
-                charEnd = m.end,
-            )
-        }
-        return result
-    }
-
-    /**
-     * Horizontal text. Per-element interpolation: we rebuild the line text from
-     * elements so Kuromoji's char offsets line up with the elements that own them,
-     * then place each morpheme inside the tight element box(es) it overlaps.
-     */
-    private fun horizontalLineBoxes(line: Text.Line, seqStart: Int, lineKey: Int): List<MorphemeBox> {
-        val elements = line.elements
-        if (elements.isEmpty()) return emptyList()
-
-        val sb = StringBuilder()
-        data class ElementRange(val box: android.graphics.Rect, val start: Int, val end: Int)
-        val ranges = ArrayList<ElementRange>(elements.size)
-        for (e in elements) {
-            val eBox = e.boundingBox ?: continue
-            val s = sb.length
-            sb.append(e.text)
-            ranges += ElementRange(eBox, s, sb.length)
-        }
-        val lineText = sb.toString()
-        if (lineText.isEmpty()) return emptyList()
-
-        val morphemes = try {
-            JapaneseTokenizer.extract(lineText)
-        } catch (e: Exception) {
-            Log.e(TAG, "Tokenize failed (horizontal)", e)
-            return emptyList()
-        }
-
-        val result = ArrayList<MorphemeBox>(morphemes.size)
-        for (m in morphemes) {
-            var left = Int.MAX_VALUE
-            var top = Int.MAX_VALUE
-            var right = Int.MIN_VALUE
-            var bottom = Int.MIN_VALUE
-
-            for (r in ranges) {
-                val overlapStart = max(r.start, m.start)
-                val overlapEnd = min(r.end, m.end)
-                if (overlapEnd <= overlapStart) continue
-                val eLen = (r.end - r.start).coerceAtLeast(1)
-                val charW = r.box.width().toFloat() / eLen
-                val l = r.box.left + ((overlapStart - r.start) * charW).toInt()
-                val rEdge = r.box.left + ((overlapEnd - r.start) * charW).toInt()
-                if (l < left) left = l
-                if (rEdge > right) right = rEdge
-                if (r.box.top < top) top = r.box.top
-                if (r.box.bottom > bottom) bottom = r.box.bottom
-            }
-
-            if (left == Int.MAX_VALUE) {
-                val lb = line.boundingBox ?: continue
-                val charW = lb.width().toFloat() / max(lineText.length, 1)
-                left = lb.left + (m.start * charW).toInt()
-                right = lb.left + (m.end * charW).toInt()
-                top = lb.top
-                bottom = lb.bottom
-            }
-
-            val width = max(right - left, 1)
-            val height = max(bottom - top, 1)
-            result += MorphemeBox(
-                left = left,
-                top = top,
-                width = width,
-                height = height,
-                morpheme = m,
-                seq = seqStart + result.size,
-                lineKey = lineKey,
-                lineText = lineText,
-                charStart = m.start,
-                charEnd = m.end,
-            )
-        }
-        return result
     }
 
     /**
@@ -1074,346 +1156,26 @@ class OverlayService : Service() {
         return box.height() > box.width() * 1.3f
     }
 
-    private fun logMorphemes(boxes: List<MorphemeBox>) {
-        Log.i(TAG, "── Morphemes (${boxes.size}) ──")
-        if (boxes.isEmpty()) {
-            Log.i(TAG, "(none)")
-        } else {
-            for (b in boxes) {
-                val m = b.morpheme
-                val rd = if (m.reading.isNotEmpty()) "  [${m.reading}]" else ""
-                Log.i(TAG, "${m.pos}  ${m.base}  (surface=${m.surface})$rd")
-            }
-        }
-        Log.i(TAG, "────────────────")
-    }
-
-    private fun renderMorphemeBoxes(boxes: List<MorphemeBox>) {
-        clearMorphemeBoxes()
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else
-            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
-
-        // Clamp box geometry to the physical screen so interpolated boxes near the
-        // edges aren't drawn (or clipped) off-screen — same fix already in sentence mode.
-        val dm = DisplayMetrics()
-        @Suppress("DEPRECATION")
-        windowManager.defaultDisplay.getRealMetrics(dm)
-        val screenW = dm.widthPixels
-        val screenH = dm.heightPixels
-
-        val padY = dp(3)
-        for (b in boxes) {
-            val view = View(this).apply {
-                background = makeBoxDrawable(selected = false)
-                isClickable = true
-                setOnClickListener { onBoxClick(b) }
-                setOnLongClickListener {
-                    onBoxLongPress(b)
-                    true
-                }
-            }
-            var lx = b.left
-            var lw = b.width
-            if (lx < 0) { lw += lx; lx = 0 }
-            if (lx + lw > screenW) lw = screenW - lx
-            var ly = b.top - padY
-            var lh = b.height + padY * 2
-            if (ly < 0) { lh += ly; ly = 0 }
-            if (ly + lh > screenH) lh = screenH - ly
-            if (lw < 1 || lh < 1) continue  // fully off-screen — skip
-            val params = WindowManager.LayoutParams(
-                lw, lh,
-                type,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.START
-                x = lx
-                y = ly
-            }
-            try {
-                windowManager.addView(view, params)
-                renderedBoxes += RenderedBox(view, b)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to add box view", e)
-            }
-        }
-        Log.i(TAG, "Rendered ${renderedBoxes.size} morpheme boxes")
-        updateOcrButtonAppearance()
-        if (renderedBoxes.isNotEmpty()) startChangeWatch()
-    }
-
-    private fun makeBoxDrawable(selected: Boolean): GradientDrawable = GradientDrawable().apply {
-        if (selected) {
-            setStroke(dp(2), Color.argb(255, 255, 165, 60))
-            setColor(Color.argb(90, 255, 165, 60))
-        } else {
-            setStroke(dp(2), Color.argb(255, 80, 220, 120))
-            setColor(Color.argb(48, 80, 220, 120))
-        }
-        cornerRadius = dp(3).toFloat()
-    }
-
-    private fun clearMorphemeBoxes() {
-        stopChangeWatch()
-        dismissPopup()
-        anchor1 = null
-        anchor2 = null
-        for (rb in renderedBoxes) {
-            runCatching { windowManager.removeView(rb.view) }
-        }
-        renderedBoxes.clear()
-        updateOcrButtonAppearance()
-    }
-
-    private fun onBoxClick(b: MorphemeBox) {
-        val a1 = anchor1
-        val a2 = anchor2
-        if (a1 != null && a2 != null && isInRange(b)) {
-            showRangePopup(a1, a2)
-        } else {
-            val m = b.morpheme
-            val rd = if (m.reading.isNotEmpty()) "  [${m.reading}]" else ""
-            Log.i(TAG, "tap → ${m.base}  (${m.pos}, surface=${m.surface})$rd")
-            showWordDetailPopup(b)
-        }
-    }
-
-    private fun onBoxLongPress(b: MorphemeBox) {
-        dismissPopup()
-        when {
-            anchor1 == null -> {
-                anchor1 = b
-                Log.i(TAG, "anchor1 set: ${b.morpheme.surface}")
-            }
-            anchor2 == null -> {
-                anchor2 = b
-                Log.i(TAG, "anchor2 set: ${b.morpheme.surface} — range committed")
-            }
-            else -> {
-                anchor1 = null
-                anchor2 = null
-                Log.i(TAG, "selection cancelled")
-            }
-        }
-        refreshBoxHighlights()
-    }
-
-    private fun isInRange(b: MorphemeBox): Boolean {
-        val a = anchor1 ?: return false
-        val c = anchor2 ?: return b.seq == a.seq
-        return b.seq in min(a.seq, c.seq)..max(a.seq, c.seq)
-    }
-
-    private fun refreshBoxHighlights() {
-        for (rb in renderedBoxes) {
-            rb.view.background = makeBoxDrawable(selected = isInRange(rb.box))
-        }
-    }
-
-    /**
-     * Single-tap popup for one morpheme box (OCR/morpheme mode): the full
-     * offline JMdict entry for the tapped word — all senses, tags, alternate
-     * forms, plus a Kanji subsection — reusing [renderWordDetail] (the same
-     * detail panel dict mode expands inline). A range selection instead runs
-     * Google Translate (see [showRangePopup]).
-     */
-    private fun showWordDetailPopup(box: MorphemeBox) {
-        dismissPopup()
-        val m = box.morpheme
-        val hasKanji = JapaneseTokenizer.containsKanji(m.base)
-        val hira = if (hasKanji && m.reading.isNotEmpty())
-            JapaneseTokenizer.katakanaToHiragana(m.reading) else ""
-        val titleStr = if (hira.isNotEmpty()) "${m.base}  $hira" else m.base
-
-        val metrics = resources.displayMetrics
-        val screenW = metrics.widthPixels
-        val screenH = metrics.heightPixels
-        val margin = dp(6)
-        val maxPopupW = min(dp(340), screenW - 2 * margin)
-        val maxScrollH = (screenH * 0.55f).toInt()
-        val textMaxW = maxPopupW - dp(28)
-
-        val titleView = TextView(this).apply {
-            text = titleStr
-            setTextColor(Color.WHITE)
-            textSize = 16f
-            setPadding(0, 0, 0, dp(2))
-        }
-        val closeBtn = TextView(this).apply {
-            text = "✕"
-            setTextColor(Color.WHITE)
-            textSize = 16f
-            setPadding(dp(12), dp(2), dp(4), dp(2))
-            isClickable = true
-            setOnClickListener { dismissPopup() }
-        }
-        val headerRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(titleView, LinearLayout.LayoutParams(
-                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            addView(makeCopyIcon { m.base }, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT))
-            addView(closeBtn, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT))
-        }
-
-        val bodyCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(TextView(this@OverlayService).apply {
-                text = "Looking up…"
-                setTextColor(Color.argb(255, 210, 210, 210))
-                textSize = 14f
-            })
-        }
-        // ScrollView capped at maxScrollH; wraps to content below the cap.
-        val scroll = object : android.widget.ScrollView(this) {
-            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-                val capped = View.MeasureSpec.makeMeasureSpec(maxScrollH, View.MeasureSpec.AT_MOST)
-                super.onMeasure(widthMeasureSpec, capped)
-            }
-        }.apply {
-            isVerticalScrollBarEnabled = true
-            addView(bodyCol, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT))
-        }
-
-        val dragHandle = makeDragHandle()
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = GradientDrawable().apply {
-                setColor(Color.argb(238, 0, 0, 0))
-                cornerRadius = dp(8).toFloat()
-            }
-            setPadding(dp(12), dp(8), dp(8), dp(8))
-            addView(dragHandle, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(2) })
-            addView(headerRow, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT))
-            addView(scroll, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT))
-        }
-
-        // Once the user drags the popup, stop auto-repositioning it (otherwise it
-        // snaps back when the async detail fills in and grows the popup).
-        var userMoved = false
-
-        // Re-clamp on-screen position whenever content changes size (the detail
-        // arrives async and the popup grows downward).
-        fun reposition() {
-            if (userMoved) return
-            val wSpec = View.MeasureSpec.makeMeasureSpec(maxPopupW, View.MeasureSpec.AT_MOST)
-            val hSpec = View.MeasureSpec.makeMeasureSpec(screenH, View.MeasureSpec.AT_MOST)
-            container.measure(wSpec, hSpec)
-            val pw = min(container.measuredWidth, maxPopupW)
-            val ph = container.measuredHeight
-            val centerX = box.left + box.width / 2
-            var x = centerX - pw / 2
-            if (x < margin) x = margin
-            if (x + pw > screenW - margin) x = screenW - margin - pw
-            var y = box.top - ph - dp(6)
-            if (y < margin) y = box.top + box.height + dp(6)
-            if (y + ph > screenH - margin) y = screenH - margin - ph
-            if (y < margin) y = margin
-            val lp = container.layoutParams as? WindowManager.LayoutParams ?: return
-            if (lp.x != x || lp.y != y) {
-                lp.x = x
-                lp.y = y
-                runCatching { windowManager.updateViewLayout(container, lp) }
-            }
-        }
-
-        // Initial measure for first placement.
-        val wSpec = View.MeasureSpec.makeMeasureSpec(maxPopupW, View.MeasureSpec.AT_MOST)
-        val hSpec = View.MeasureSpec.makeMeasureSpec(screenH, View.MeasureSpec.AT_MOST)
-        container.measure(wSpec, hSpec)
-        val pw0 = min(container.measuredWidth, maxPopupW)
-        val ph0 = container.measuredHeight
-        val centerX0 = box.left + box.width / 2
-        var x0 = centerX0 - pw0 / 2
-        if (x0 < margin) x0 = margin
-        if (x0 + pw0 > screenW - margin) x0 = screenW - margin - pw0
-        var y0 = box.top - ph0 - dp(6)
-        if (y0 < margin) y0 = box.top + box.height + dp(6)
-        if (y0 + ph0 > screenH - margin) y0 = screenH - margin - ph0
-        if (y0 < margin) y0 = margin
-
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else
-            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            type,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            this.x = x0
-            this.y = y0
-        }
-
-        try {
-            windowManager.addView(container, params)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to add detail popup", e)
-            return
-        }
-
-        val holder = PopupHolder(container, titleView)
-        popup = holder
-
-        // Drag to move via the handle bar or header row.
-        val onDrag = { userMoved = true }
-        attachPopupDrag(dragHandle, container, params, onDrag)
-        attachPopupDrag(headerRow, container, params, onDrag)
-
-        // Look the word up off the main thread.
-        Thread {
-            JmDict.warmUp(this)
-            val available = JmDict.isAvailable()
-            val details = if (available) JmDict.lookupWordDetail(m.base) else emptyList()
-            val kanji = if (available) kanjiInfoForWord(m.base) else emptyList()
-            mainHandler.post {
-                if (popup !== holder) return@post
-                bodyCol.removeAllViews()
-                when {
-                    !available -> bodyCol.addView(TextView(this@OverlayService).apply {
-                        text = "Dictionary not built"
-                        setTextColor(Color.argb(255, 160, 160, 160))
-                        textSize = 13f
-                    })
-                    details.isEmpty() && kanji.isEmpty() -> bodyCol.addView(TextView(this@OverlayService).apply {
-                        text = "(no dictionary entry)"
-                        setTextColor(Color.argb(255, 160, 160, 160))
-                        textSize = 13f
-                    })
-                    else -> bodyCol.addView(renderWordDetail(details, kanji, textMaxW))
-                }
-                container.post { reposition() }
-            }
-        }.start()
-    }
-
     private fun dismissPopup() {
         popup?.let { runCatching { windowManager.removeView(it.view) } }
         popup = null
+        // Invalidate any popup lookup still in flight (e.g. overlays were cleared
+        // while a tapped sentence was still translating).
+        popupRequestSeq++
+        // Bring the transparent sentence boxes back (hidden while the popup was up).
+        setSentenceBoxesVisible(true)
+        updateOcrButtonAppearance()
+    }
+
+    /**
+     * Hides/shows the transparent sentence boxes while the analysis popup is
+     * open, so the popup is the only overlay on screen. The box windows are kept
+     * alive — this only flips view visibility, so it costs nothing (no re-OCR,
+     * no re-layout) and the boxes come back instantly when the popup closes.
+     */
+    private fun setSentenceBoxesVisible(visible: Boolean) {
+        val v = if (visible) View.VISIBLE else View.INVISIBLE
+        for (rb in renderedSentenceBoxes) rb.view.visibility = v
     }
 
     /**
@@ -1450,223 +1212,6 @@ class OverlayService : Service() {
         return icon
     }
 
-    /**
-     * A wide, tall drag-grip strip for the top of a popup: a thin visible bar centered
-     * inside a full-width row with generous vertical padding, so the touch target for
-     * dragging is large (a 5dp bar alone is easy to miss).
-     */
-    private fun makeDragHandle(): View {
-        val bar = View(this).apply {
-            background = GradientDrawable().apply {
-                cornerRadius = dp(2).toFloat()
-                setColor(Color.argb(160, 255, 255, 255))
-            }
-        }
-        return FrameLayout(this).apply {
-            setPadding(0, dp(11), 0, dp(11))
-            isClickable = true
-            addView(bar, FrameLayout.LayoutParams(dp(60), dp(6)).apply {
-                gravity = Gravity.CENTER_HORIZONTAL
-            })
-        }
-    }
-
-    /**
-     * Makes a popup window draggable by grabbing [handle] (e.g. its header row) and
-     * moving [container]'s window. [onMove] fires on each drag step (used to suppress
-     * the async auto-reposition once the user has taken over placement).
-     */
-    private fun attachPopupDrag(
-        handle: View,
-        container: View,
-        params: WindowManager.LayoutParams,
-        onMove: () -> Unit = {},
-    ) {
-        var ix = 0
-        var iy = 0
-        var sx = 0f
-        var sy = 0f
-        handle.setOnTouchListener { _, e ->
-            when (e.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    ix = params.x; iy = params.y; sx = e.rawX; sy = e.rawY; true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    params.x = ix + (e.rawX - sx).toInt()
-                    params.y = iy + (e.rawY - sy).toInt()
-                    onMove()
-                    runCatching { windowManager.updateViewLayout(container, params) }
-                    true
-                }
-                else -> false
-            }
-        }
-    }
-
-    /** Reconstructs the natural-language text spanned by anchors a and b. */
-    private fun buildRangeText(a: MorphemeBox, b: MorphemeBox): String {
-        val (lo, hi) = if (a.seq <= b.seq) a to b else b to a
-        val inRange = renderedBoxes.map { it.box }.filter { it.seq in lo.seq..hi.seq }
-        if (inRange.isEmpty()) return ""
-
-        // Group by line, ordered by reading position.
-        val byLine = LinkedHashMap<Int, MutableList<MorphemeBox>>()
-        for (mb in inRange.sortedBy { it.seq }) {
-            byLine.getOrPut(mb.lineKey) { mutableListOf() } += mb
-        }
-
-        val sb = StringBuilder()
-        for ((key, boxes) in byLine) {
-            val lineText = boxes.first().lineText
-            val from = if (key == lo.lineKey) lo.charStart else 0
-            val to = if (key == hi.lineKey) hi.charEnd else lineText.length
-            if (from in 0..lineText.length && to in from..lineText.length) {
-                sb.append(lineText, from, to)
-            }
-        }
-        return sb.toString()
-    }
-
-    private fun showRangePopup(a: MorphemeBox, b: MorphemeBox) {
-        dismissPopup()
-        val rangeText = buildRangeText(a, b)
-        if (rangeText.isBlank()) return
-        val readingHira = JapaneseTokenizer.fullReadingHiragana(rangeText)
-
-        val titleView = TextView(this).apply {
-            text = rangeText
-            setTextColor(Color.WHITE)
-            textSize = 16f
-            setPadding(0, 0, 0, dp(2))
-            maxWidth = resources.displayMetrics.widthPixels - dp(60)
-        }
-        val readingView = TextView(this).apply {
-            text = readingHira
-            setTextColor(Color.argb(255, 180, 220, 255))
-            textSize = 13f
-            setPadding(0, 0, 0, dp(4))
-            maxWidth = resources.displayMetrics.widthPixels - dp(60)
-        }
-        val translationView = TextView(this).apply {
-            text = "Translating…"
-            setTextColor(Color.argb(255, 210, 210, 210))
-            textSize = 14f
-            maxWidth = resources.displayMetrics.widthPixels - dp(60)
-        }
-        val textCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(titleView)
-            addView(readingView)
-            addView(translationView)
-        }
-        val closeBtn = TextView(this).apply {
-            text = "✕"
-            setTextColor(Color.WHITE)
-            textSize = 16f
-            setPadding(dp(12), dp(2), dp(4), dp(2))
-            isClickable = true
-            setOnClickListener { dismissPopup() }
-        }
-        val dragHandle = makeDragHandle()
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(textCol, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-            addView(closeBtn, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-        }
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = GradientDrawable().apply {
-                setColor(Color.argb(235, 0, 0, 0))
-                cornerRadius = dp(8).toFloat()
-            }
-            setPadding(dp(12), dp(8), dp(8), dp(8))
-            addView(dragHandle, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(2) })
-            addView(row, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-        }
-
-        val unspec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
-        container.measure(unspec, unspec)
-        val pw = container.measuredWidth
-        val ph = container.measuredHeight
-
-        // Position above the topmost box in the range, centered horizontally on its midpoint.
-        val (lo, hi) = if (a.seq <= b.seq) a to b else b to a
-        val topBox = if (lo.top <= hi.top) lo else hi
-        val screenW = resources.displayMetrics.widthPixels
-        val centerX = topBox.left + topBox.width / 2
-        var x = centerX - pw / 2
-        var y = topBox.top - ph - dp(6)
-        val margin = dp(4)
-        if (x < margin) x = margin
-        if (x + pw > screenW - margin) x = screenW - margin - pw
-        if (y < margin) y = topBox.top + topBox.height + dp(6)
-
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else
-            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            type,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            this.x = x
-            this.y = y
-        }
-
-        try {
-            windowManager.addView(container, params)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to add range popup", e)
-            return
-        }
-
-        val holder = PopupHolder(container, translationView)
-        popup = holder
-
-        // Drag to move via the handle bar or the text row.
-        attachPopupDrag(dragHandle, container, params)
-        attachPopupDrag(row, container, params)
-
-        Log.i(TAG, "range = \"$rangeText\"   hira = \"$readingHira\"")
-
-        Thread {
-            // Only show a translation when the offline FuguMT model is loaded (built by
-            // scripts/build_fugumt.py + warmed on entering this mode); otherwise omit it.
-            val ready = Translator.isAvailable()
-            val result = if (ready) try {
-                Translator.translateJaToEn(rangeText)
-            } catch (e: Throwable) {
-                Log.e(TAG, "Range translation failed", e)
-                ""
-            } else ""
-            mainHandler.post {
-                if (popup === holder) {
-                    if (!ready) translationView.visibility = View.GONE
-                    else translationView.text = if (result.isBlank()) "(no translation)" else result
-                }
-            }
-        }.start()
-    }
-
     // ───────────────────────── Sentence mode (dict) ─────────────────────────
 
     /**
@@ -1694,12 +1239,13 @@ class OverlayService : Service() {
         // The "+" Add-to-Anki button only appears when AnkiDroid is installed, its API
         // permission is granted, and a deck name is set (configured on the home screen).
         val showAnki = AnkiDroidHelper.isConfigured(this)
-        // Reserve width for the leading "+" (only when shown) and trailing chevron.
+        // The label is weighted (0dp + weight 1), so it wraps inside whatever space
+        // the fixed-width row leaves after the "+" and the chevron — and the chevron
+        // stays pinned at the row's right edge on every row.
         val label = TextView(this).apply {
             text = labelText
             setTextColor(Color.argb(255, 230, 230, 230))
             textSize = 13f
-            maxWidth = textMaxW - (if (showAnki) dp(44) else 0) - if (expandable) dp(34) else 0
         }
         val addBtn: TextView? = if (showAnki) {
             val b = TextView(this).apply {
@@ -1732,8 +1278,7 @@ class OverlayService : Service() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { rightMargin = dp(8) })
             addView(label, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
             ))
         }
 
@@ -1760,9 +1305,10 @@ class OverlayService : Service() {
             // Indent under the word, leaving a touch of left padding.
             setPadding(dp(12), 0, 0, dp(4))
         }
-        // Note: we deliberately do NOT reposition the popup on expand/collapse —
-        // the popup stays anchored at its top-left and just grows downward, so the
-        // sections (incl. Translation) don't jump sideways when content resizes.
+        // Note: expand/collapse doesn't re-anchor the popup — it grows downward in
+        // place (no sideways jumps; width is fixed). If the growth would push it
+        // past the bottom edge, the popup window's layout listener clamps it back
+        // on-screen (see buildAnalysisPopup).
         var loaded = false
         chevron.setOnClickListener {
             if (detail.visibility == View.VISIBLE) {
@@ -2277,7 +1823,9 @@ class OverlayService : Service() {
             fun flushSentence() {
                 if (pendingPieces.isEmpty()) return
                 val full = pendingText.toString().trim()
-                if (full.isNotEmpty()) {
+                // Only render sentences that actually contain Japanese — OCR picks up
+                // plenty of Latin/digit UI text that just clutters the overlay.
+                if (full.isNotEmpty() && JapaneseTokenizer.containsJapanese(full)) {
                     for (p in pendingPieces) {
                         out += SentenceBox(
                             left = p.rect.left,
@@ -2374,9 +1922,6 @@ class OverlayService : Service() {
     }
 
     private fun clearSentenceBoxes() {
-        if (renderedSentenceBoxes.isEmpty() && popup == null) {
-            // popup may belong to morpheme mode; only dismiss if we own boxes
-        }
         stopChangeWatch()
         dismissPopup()
         for (rb in renderedSentenceBoxes) {
@@ -2388,46 +1933,17 @@ class OverlayService : Service() {
 
     private fun onSentenceClick(box: SentenceBox) {
         Log.i(TAG, "sentence tap → ${box.fullText}")
-        if (mode == MODE_TRANSLATE) showTranslatePopup(box) else showDictAnalysisPopup(box)
+        showDictAnalysisPopup(
+            box.fullText,
+            android.graphics.Rect(box.left, box.top, box.left + box.width, box.top + box.height),
+        )
     }
 
     /**
-     * Translation-only sentence popup (MODE_TRANSLATE). Reuses the analysis-popup
-     * scaffold but fills in nothing except the offline FuguMT translation.
-     */
-    private fun showTranslatePopup(box: SentenceBox) {
-        val ui = buildAnalysisPopup(box) ?: return
-        // Translation-only: no word-by-word section.
-        ui.wordHeader.visibility = View.GONE
-        ui.wordBody.text = "Translating…"
-
-        val sentence = box.fullText
-        Thread {
-            Translator.warmUp(this)
-            val translation = runCatching { Translator.translateJaToEn(sentence) }.getOrDefault("")
-            mainHandler.post {
-                if (popup !== ui.holder) return@post
-                ui.wordBody.visibility = View.GONE
-                if (translation.isBlank()) {
-                    ui.wordBody.visibility = View.VISIBLE
-                    ui.wordBody.text =
-                        if (Translator.isAvailable()) "(no translation)"
-                        else "Translation model not built."
-                } else {
-                    ui.transBody.text = translation
-                    ui.transHeader.visibility = View.VISIBLE
-                    ui.transBody.visibility = View.VISIBLE
-                }
-                ui.container.post { ui.reposition() }
-            }
-        }.start()
-    }
-
-    /**
-     * The offline dict-mode analysis popup scaffold. Holds the section views the
-     * dict lookup populates (Word-by-word list, Reading, Translation), plus the
-     * [reposition] helper that re-clamps the popup once its content grows. (The
-     * Kanji/Notes section views are unused leftovers from the removed LLM mode.)
+     * The analysis popup scaffold. The caller fills the section views
+     * (Word-by-word list, Reading, Translation) and then calls [show] — the
+     * window is only added once fully populated, so it appears in its final
+     * position at its final size (no loading placeholder → no flicker or jump).
      */
     private class AnalysisPopup(
         val holder: PopupHolder,
@@ -2437,73 +1953,94 @@ class OverlayService : Service() {
         val wordList: LinearLayout,
         val readingHeader: TextView,
         val readingBody: TextView,
-        val kanjiHeader: TextView,
-        val kanjiBody: TextView,
         val transHeader: TextView,
         val transBody: TextView,
-        val notesHeader: TextView,
-        val notesBody: TextView,
         val textMaxW: Int,
-        val reposition: () -> Unit,
+        val show: () -> Unit,
     )
 
     /**
-     * Builds + shows the empty analysis popup for [box] (header/drag handle,
-     * scrollable Word-by-word / Kanji / Translation / Notes sections), positions
-     * it, and registers it as the current [popup]. Returns the view handles so the
-     * caller can fill them in, or null if the window couldn't be added.
+     * Builds the analysis popup for [anchor] but does NOT add the window —
+     * populate the sections first, then call [AnalysisPopup.show].
+     *
+     * Layout rules that keep it glitch-free:
+     * - The window is only added once fully populated ([AnalysisPopup.show]),
+     *   measured at its final size and anchored in one shot — no placeholder,
+     *   no post-load reposition, no flicker. While it's up the transparent
+     *   sentence boxes are hidden ([setSentenceBoxesVisible]); they return when
+     *   it closes.
+     * - The window width is **fixed** (`min(screen − 16dp, 400dp)`) — content
+     *   can never change the popup's width, so text wraps predictably and
+     *   expand panels can't push it off-screen sideways.
+     * - Height wraps content but is hard-capped (~65% of screen) by the section
+     *   ScrollView, whose cap is computed from what the top bar + title actually
+     *   used. A layout listener re-clamps the window position whenever the
+     *   height changes (chevron expand/collapse), so the popup can never end up
+     *   past the bottom edge — even after the user dragged it.
+     * - Top bar = centered grip + ✕ at the right; the title sits on its own line
+     *   below (weighted width so it wraps fully, max 4 lines ellipsized — the
+     *   copy icon copies the complete text) — nothing overlaps or clips.
+     * - Dragging is via the top bar or title row ONLY — a container-wide drag
+     *   listener was tried and reverted (it fought the scroll/click gestures).
      */
-    private fun buildAnalysisPopup(box: SentenceBox): AnalysisPopup? {
-        dismissPopup()
-        userMovedPopup = false
-
+    private fun buildAnalysisPopup(anchor: android.graphics.Rect, title: String): AnalysisPopup {
         val screenW = resources.displayMetrics.widthPixels
         val screenH = resources.displayMetrics.heightPixels
         val sideMargin = dp(8)
-        val maxPopupW = screenW - sideMargin * 2
+        val popupW = min(screenW - sideMargin * 2, dp(400))
         val maxPopupH = (screenH * 0.65f).toInt()
-        // Cap for text wrapping: popup max width minus container padding minus
-        // close-button column. Text wraps before exceeding this.
-        val textMaxW = maxPopupW - dp(12) - dp(8) - dp(44)
-        // Reserve max scroll height = popup cap minus header row height budget.
-        val maxScrollH = maxPopupH - dp(60)
+        // Width available to content inside the container padding — labels and
+        // detail panels wrap before hitting the popup edge.
+        val textMaxW = popupW - dp(12) - dp(12)
 
-        val titleView = TextView(this).apply {
-            text = box.fullText
-            setTextColor(Color.WHITE)
-            textSize = 15f
-            maxWidth = textMaxW
+        // ── Top bar: drag grip centered, ✕ at the right ──
+        val gripBar = View(this).apply {
+            background = GradientDrawable().apply {
+                cornerRadius = dp(2).toFloat()
+                setColor(Color.argb(160, 255, 255, 255))
+            }
         }
         val closeBtn = TextView(this).apply {
             text = "✕"
             setTextColor(Color.WHITE)
-            textSize = 20f
-            setPadding(dp(10), dp(2), dp(10), dp(2))
+            textSize = 15f
+            gravity = Gravity.CENTER
             isClickable = true
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.argb(60, 255, 255, 255))
+            }
+            contentDescription = "Close"
             setOnClickListener { dismissPopup() }
         }
-        // Translate mode shows only the translation — no Japanese source title and
-        // no copy icon (the sentence is offscreen content, not what the user wants).
-        val translateMode = mode == MODE_TRANSLATE
-        // Keep the (now empty) title as a weighted spacer so ✕ stays on the right.
-        if (translateMode) titleView.text = ""
-        val headerRow = LinearLayout(this).apply {
+        val topBar = FrameLayout(this).apply {
+            minimumHeight = dp(36)
+            addView(gripBar, FrameLayout.LayoutParams(dp(48), dp(5)).apply {
+                gravity = Gravity.CENTER
+            })
+            addView(closeBtn, FrameLayout.LayoutParams(dp(28), dp(28)).apply {
+                gravity = Gravity.CENTER_VERTICAL or Gravity.END
+            })
+        }
+
+        // ── Title row: the sentence (weighted → wraps fully, never clipped) + copy ──
+        val titleView = TextView(this).apply {
+            text = title
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            maxLines = 4
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        val titleRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
             addView(titleView, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                1f
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
             ))
-            if (!translateMode) addView(makeCopyIcon { box.fullText }, LinearLayout.LayoutParams(
+            addView(makeCopyIcon { title }, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ))
-            addView(closeBtn, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-            setPadding(0, 0, 0, dp(6))
+            setPadding(0, dp(2), 0, dp(6))
         }
 
         val wordHeader = TextView(this).apply {
@@ -2513,7 +2050,6 @@ class OverlayService : Service() {
             setPadding(0, dp(4), 0, dp(2))
         }
         val wordBody = TextView(this).apply {
-            text = "Analyzing…"
             setTextColor(Color.argb(255, 230, 230, 230))
             textSize = 13f
             maxWidth = textMaxW
@@ -2537,19 +2073,6 @@ class OverlayService : Service() {
             maxWidth = textMaxW
             visibility = View.GONE
         }
-        val kanjiHeader = TextView(this).apply {
-            text = "Kanji"
-            setTextColor(Color.argb(255, 180, 220, 255))
-            textSize = 12f
-            setPadding(0, dp(6), 0, dp(2))
-            visibility = View.GONE
-        }
-        val kanjiBody = TextView(this).apply {
-            setTextColor(Color.argb(255, 230, 230, 230))
-            textSize = 13f
-            maxWidth = textMaxW
-            visibility = View.GONE
-        }
         val transHeader = TextView(this).apply {
             text = "Translation"
             setTextColor(Color.argb(255, 180, 220, 255))
@@ -2563,20 +2086,6 @@ class OverlayService : Service() {
             maxWidth = textMaxW
             visibility = View.GONE
         }
-        val notesHeader = TextView(this).apply {
-            text = "Notes"
-            setTextColor(Color.argb(255, 180, 220, 255))
-            textSize = 12f
-            setPadding(0, dp(6), 0, dp(2))
-            visibility = View.GONE
-        }
-        val notesBody = TextView(this).apply {
-            setTextColor(Color.argb(255, 230, 230, 230))
-            textSize = 13f
-            maxWidth = textMaxW
-            visibility = View.GONE
-        }
-
         val sectionsCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(wordHeader)
@@ -2584,51 +2093,48 @@ class OverlayService : Service() {
             addView(wordList)
             addView(readingHeader)
             addView(readingBody)
-            addView(kanjiHeader)
-            addView(kanjiBody)
             addView(transHeader)
             addView(transBody)
-            addView(notesHeader)
-            addView(notesBody)
         }
-        // ScrollView that caps its own height. Below the cap it wraps to content
-        // (so the popup stays small for short answers); past the cap it scrolls.
+        // ScrollView that caps its own height so top bar + title + sections never
+        // exceed maxPopupH. Below the cap it wraps to content (the popup stays
+        // small for short answers); past the cap it scrolls. The vertical
+        // LinearLayout parent measures children top-to-bottom, so the bars above
+        // are already measured when this runs.
         val scroll = object : android.widget.ScrollView(this) {
             override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-                val capped = View.MeasureSpec.makeMeasureSpec(maxScrollH, View.MeasureSpec.AT_MOST)
-                super.onMeasure(widthMeasureSpec, capped)
+                val used = topBar.measuredHeight + titleRow.measuredHeight + dp(24)
+                val cap = (maxPopupH - used).coerceAtLeast(dp(80))
+                super.onMeasure(
+                    widthMeasureSpec,
+                    View.MeasureSpec.makeMeasureSpec(cap, View.MeasureSpec.AT_MOST)
+                )
             }
         }.apply {
             isVerticalScrollBarEnabled = true
-            addView(sectionsCol, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
+            addView(sectionsCol, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
             ))
         }
 
-        // A small white grab bar centered at the top to signal the popup is draggable.
-        // It (and the header row) move the popup — see the touch listener below.
-        val dragHandle = makeDragHandle()
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
                 setColor(Color.argb(238, 0, 0, 0))
-                cornerRadius = dp(8).toFloat()
+                cornerRadius = dp(10).toFloat()
             }
-            setPadding(dp(12), dp(8), dp(8), dp(8))
-            addView(dragHandle, LinearLayout.LayoutParams(
+            setPadding(dp(12), dp(4), dp(12), dp(10))
+            addView(topBar, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(2) })
-            // MATCH_PARENT here so the header row stretches to the popup's
-            // natural width (determined by the scroll content), letting the
-            // title's weight=1 push the ✕ to the right edge.
-            addView(headerRow, LinearLayout.LayoutParams(
+            ))
+            addView(titleRow, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ))
             addView(scroll, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ))
         }
@@ -2638,50 +2144,24 @@ class OverlayService : Service() {
         else
             @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
-        // Re-clamp the popup's on-screen position whenever its content changes
-        // size (e.g. when the dictionary lookup fills in the sections).
-        fun reposition() {
-            if (userMovedPopup) return
-            val wSpec = View.MeasureSpec.makeMeasureSpec(maxPopupW, View.MeasureSpec.AT_MOST)
+        // The window width is exact, so only the height ever needs measuring.
+        fun measuredHeight(): Int {
+            val wSpec = View.MeasureSpec.makeMeasureSpec(popupW, View.MeasureSpec.EXACTLY)
             val hSpec = View.MeasureSpec.makeMeasureSpec(maxPopupH, View.MeasureSpec.AT_MOST)
             container.measure(wSpec, hSpec)
-            val pw = min(container.measuredWidth, maxPopupW)
-            val ph = min(container.measuredHeight, maxPopupH)
-
-            val centerX = box.left + box.width / 2
-            var x = centerX - pw / 2
-            if (x < sideMargin) x = sideMargin
-            if (x + pw > screenW - sideMargin) x = screenW - sideMargin - pw
-            var y = box.top - ph - dp(6)
-            if (y < sideMargin) y = box.top + box.height + dp(6)
-            if (y + ph > screenH - sideMargin) y = screenH - sideMargin - ph
-            if (y < sideMargin) y = sideMargin
-
-            val lp = container.layoutParams as? WindowManager.LayoutParams ?: return
-            if (lp.x != x || lp.y != y) {
-                lp.x = x
-                lp.y = y
-                runCatching { windowManager.updateViewLayout(container, lp) }
-            }
+            return container.measuredHeight
+        }
+        fun anchoredX(): Int = (anchor.centerX() - popupW / 2)
+            .coerceIn(sideMargin, (screenW - sideMargin - popupW).coerceAtLeast(sideMargin))
+        fun anchoredY(ph: Int): Int {
+            var y = anchor.top - ph - dp(6)               // prefer above the anchor
+            if (y < sideMargin) y = anchor.bottom + dp(6) // else below it
+            y = y.coerceAtMost(screenH - sideMargin - ph) // never past the bottom
+            return y.coerceAtLeast(sideMargin)
         }
 
-        // Initial measure for first placement; popup itself remains WRAP_CONTENT.
-        val wSpec = View.MeasureSpec.makeMeasureSpec(maxPopupW, View.MeasureSpec.AT_MOST)
-        val hSpec = View.MeasureSpec.makeMeasureSpec(maxPopupH, View.MeasureSpec.AT_MOST)
-        container.measure(wSpec, hSpec)
-        val pw0 = min(container.measuredWidth, maxPopupW)
-        val ph0 = min(container.measuredHeight, maxPopupH)
-        val centerX0 = box.left + box.width / 2
-        var x0 = centerX0 - pw0 / 2
-        if (x0 < sideMargin) x0 = sideMargin
-        if (x0 + pw0 > screenW - sideMargin) x0 = screenW - sideMargin - pw0
-        var y0 = box.top - ph0 - dp(6)
-        if (y0 < sideMargin) y0 = box.top + box.height + dp(6)
-        if (y0 + ph0 > screenH - sideMargin) y0 = screenH - sideMargin - ph0
-        if (y0 < sideMargin) y0 = sideMargin
-
         val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            popupW,
             WindowManager.LayoutParams.WRAP_CONTENT,
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -2690,24 +2170,57 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = x0
-            y = y0
         }
 
-        try {
-            windowManager.addView(container, params)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to add analysis popup", e)
-            return null
+        // Keeps the popup fully on-screen at its *current* position (after drags
+        // and content growth) — moves it back just enough, without re-anchoring.
+        fun clampToScreen() {
+            val lp = container.layoutParams as? WindowManager.LayoutParams ?: return
+            val h = if (container.height > 0) container.height else measuredHeight()
+            val nx = lp.x.coerceIn(0, (screenW - popupW).coerceAtLeast(0))
+            val ny = lp.y.coerceIn(0, (screenH - h).coerceAtLeast(0))
+            if (nx != lp.x || ny != lp.y) {
+                lp.x = nx
+                lp.y = ny
+                runCatching { windowManager.updateViewLayout(container, lp) }
+            }
         }
+
         val holder = PopupHolder(container, wordBody)
-        popup = holder
 
-        // Drag-to-move via the header row. The ✕ button is clickable and
-        // consumes its own touches first, so taps on it still close the popup;
-        // anything else in the header row (title text + padding) drags.
-        // Once dragged, suppress the auto-reposition that runs when content
-        // grows — otherwise the popup snaps back when the lookup fills in.
+        // Adds the window — call only after the sections are populated, so the
+        // popup appears once, at its final size and position. The sentence boxes
+        // are hidden while it's up (dismissPopup brings them back).
+        fun show() {
+            dismissPopup()
+            userMovedPopup = false
+            val ph = measuredHeight()
+            params.x = anchoredX()
+            params.y = anchoredY(ph)
+            try {
+                windowManager.addView(container, params)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to add analysis popup", e)
+                return
+            }
+            setSentenceBoxesVisible(false)
+            // Whatever grows the popup later (chevron expand panels), never let
+            // it hang past the screen edge — this runs regardless of whether the
+            // user has dragged the popup.
+            container.addOnLayoutChangeListener { _, _, top, _, bottom, _, oldTop, _, oldBottom ->
+                if (bottom - top != oldBottom - oldTop) mainHandler.post { clampToScreen() }
+            }
+            // Gentle fade-in instead of popping into existence.
+            container.alpha = 0f
+            container.animate().alpha(1f).setDuration(120).start()
+            popup = holder
+            updateOcrButtonAppearance()
+        }
+
+        // Drag-to-move via the top bar or the title row (the ✕ / copy icons are
+        // clickable and consume their own touches first). Once dragged,
+        // userMovedPopup is set — clampToScreen still keeps the popup on-screen
+        // when it later grows.
         var dragInitialX = 0
         var dragInitialY = 0
         var dragStartRawX = 0f
@@ -2722,8 +2235,13 @@ class OverlayService : Service() {
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    params.x = dragInitialX + (event.rawX - dragStartRawX).toInt()
-                    params.y = dragInitialY + (event.rawY - dragStartRawY).toInt()
+                    // Clamp within the screen so the popup can't be dragged (and
+                    // lost) off an edge.
+                    val h = if (container.height > 0) container.height else measuredHeight()
+                    params.x = (dragInitialX + (event.rawX - dragStartRawX).toInt())
+                        .coerceIn(0, (screenW - popupW).coerceAtLeast(0))
+                    params.y = (dragInitialY + (event.rawY - dragStartRawY).toInt())
+                        .coerceIn(0, (screenH - h).coerceAtLeast(0))
                     userMovedPopup = true
                     runCatching { windowManager.updateViewLayout(container, params) }
                     true
@@ -2731,8 +2249,8 @@ class OverlayService : Service() {
                 else -> false
             }
         }
-        headerRow.setOnTouchListener(dragListener)
-        dragHandle.setOnTouchListener(dragListener)
+        topBar.setOnTouchListener(dragListener)
+        titleRow.setOnTouchListener(dragListener)
 
         return AnalysisPopup(
             holder = holder,
@@ -2742,28 +2260,44 @@ class OverlayService : Service() {
             wordList = wordList,
             readingHeader = readingHeader,
             readingBody = readingBody,
-            kanjiHeader = kanjiHeader,
-            kanjiBody = kanjiBody,
             transHeader = transHeader,
             transBody = transBody,
-            notesHeader = notesHeader,
-            notesBody = notesBody,
             textMaxW = textMaxW,
-            reposition = { reposition() },
+            show = { show() },
         )
     }
 
     /**
-     * Offline sentence-mode popup (MODE_SENTENCE_DICT). Word-by-word comes from
-     * Kuromoji morphemes glossed against JMdict (each row expandable to the full
-     * JMdict + KANJIDIC2 detail); the full-sentence translation from the offline
-     * FuguMT model. Everything runs on-device — nothing leaves the device.
+     * The analysis popup (both modes: sentence-box tap and crop). Which sections
+     * appear is controlled by the home-screen toggles: Dictionary = word-by-word
+     * rows (morphemes glossed against JMdict, each expandable to the full JMdict
+     * + KANJIDIC2 detail), Reading = the full kana reading, Translation = the
+     * offline FuguMT translation. Everything runs on-device — nothing leaves the
+     * device. [anchor] is the screen rect the popup positions itself around (the
+     * tapped sentence box, or the crop selection).
+     *
+     * All lookups run BEFORE the popup is built and shown — there is no loading
+     * placeholder, so the popup appears exactly once, fully populated, at its
+     * final size and position (no flicker/jump when data arrives). A newer tap
+     * or a dismissed overlay supersedes an in-flight lookup via [popupRequestSeq].
      */
-    private fun showDictAnalysisPopup(box: SentenceBox) {
-        val ui = buildAnalysisPopup(box) ?: return
-        ui.wordBody.text = "Looking up…"
+    private fun showDictAnalysisPopup(sentence: String, anchor: android.graphics.Rect) {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val showDictionary = prefs.getBoolean(PREF_SHOW_DICTIONARY, true)
+        val showReading = prefs.getBoolean(PREF_SHOW_READING, true)
+        val showTranslation = prefs.getBoolean(PREF_SHOW_TRANSLATION, true)
 
-        val sentence = box.fullText
+        if (!showDictionary && !showReading && !showTranslation) {
+            // Nothing to fetch — show the hint immediately.
+            val ui = buildAnalysisPopup(anchor, sentence)
+            ui.wordHeader.visibility = View.GONE
+            ui.wordBody.text =
+                "All sections are off — enable Reading, Translation or Dictionary on the JP Lens home screen."
+            ui.show()
+            return
+        }
+
+        val requestId = ++popupRequestSeq
         Thread {
             // No-op if handleStart already warmed it; guards against a tap that
             // races the warm-up.
@@ -2777,7 +2311,7 @@ class OverlayService : Service() {
             // rarely-used kanji. The gloss/detail/Anki still key off a dictionary
             // lookup form (see lookupKey below).
             val entries = ArrayList<WordEntry>()
-            if (available) {
+            if (showDictionary && available) {
                 val morphemes = runCatching { JapaneseTokenizer.extract(sentence) }
                     .getOrDefault(emptyList())
                 for (m in morphemes) {
@@ -2807,21 +2341,30 @@ class OverlayService : Service() {
 
             // Full kana reading of the whole sentence (mode-A re-tokenization, so
             // particles/auxiliaries get readings too), built from Sudachi.
-            val reading = runCatching { JapaneseTokenizer.fullReadingHiragana(sentence) }
-                .getOrDefault("")
+            val reading = if (showReading)
+                runCatching { JapaneseTokenizer.fullReadingHiragana(sentence) }.getOrDefault("")
+            else ""
 
-            // No standalone Kanji section in dict mode — each word's own kanji are
-            // folded into that word's expandable detail panel (see buildWordRow).
-            val translation = runCatching { Translator.translateJaToEn(sentence) }.getOrDefault("")
+            // No standalone Kanji section — each word's own kanji are folded into
+            // that word's expandable detail panel (see buildWordRow).
+            val translation = if (showTranslation)
+                runCatching { Translator.translateJaToEn(sentence) }.getOrDefault("")
+            else ""
 
             mainHandler.post {
-                if (popup !== ui.holder) return@post
-                if (!available) {
+                // A newer tap (or a cleared/dismissed overlay) superseded this
+                // lookup while it was running — drop it silently.
+                if (requestId != popupRequestSeq) return@post
+
+                val ui = buildAnalysisPopup(anchor, sentence)
+                if (!showDictionary) {
+                    ui.wordHeader.visibility = View.GONE
+                    ui.wordBody.visibility = View.GONE
+                } else if (!available) {
                     ui.wordBody.text =
                         "Dictionary not built — run scripts/build_jmdict_db.py and reinstall."
                 } else if (entries.isNotEmpty()) {
                     ui.wordBody.visibility = View.GONE
-                    ui.wordList.removeAllViews()
                     for (w in entries) {
                         ui.wordList.addView(
                             buildWordRow(w, ui.textMaxW, sentence, translation, expandable = true)
@@ -2836,12 +2379,18 @@ class OverlayService : Service() {
                     ui.readingHeader.visibility = View.VISIBLE
                     ui.readingBody.visibility = View.VISIBLE
                 }
-                if (translation.isNotBlank()) {
-                    ui.transBody.text = translation
+                if (showTranslation) {
+                    // The toggle is on, so surface a failure instead of silently
+                    // hiding the section.
+                    ui.transBody.text = when {
+                        translation.isNotBlank() -> translation
+                        Translator.isAvailable() -> "(no translation)"
+                        else -> "Translation model not built."
+                    }
                     ui.transHeader.visibility = View.VISIBLE
                     ui.transBody.visibility = View.VISIBLE
                 }
-                ui.container.post { ui.reposition() }
+                ui.show()
             }
         }.start()
     }
@@ -2850,14 +2399,15 @@ class OverlayService : Service() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        // Rebuild capture surface for new orientation. Stale boxes are now wrong, drop them.
-        clearMorphemeBoxes()
+        // Rebuild capture surface for new orientation. Stale boxes are now wrong,
+        // drop them; a pending crop selection is against the old snapshot, cancel it.
+        cancelCropSelector()
         clearSentenceBoxes()
         if (mediaProjection != null) setupVirtualDisplay()
     }
 
     override fun onDestroy() {
-        clearMorphemeBoxes()
+        cancelCropSelector()
         clearSentenceBoxes()
         dismissRadialMenu()
         floatingView?.let { runCatching { windowManager.removeView(it) } }

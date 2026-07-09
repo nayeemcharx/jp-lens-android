@@ -64,7 +64,7 @@ object JapaneseTokenizer {
     }
 
     /** True if [s] contains at least one hiragana, katakana, or kanji character. */
-    private fun containsJapanese(s: String): Boolean {
+    fun containsJapanese(s: String): Boolean {
         for (c in s) {
             val code = c.code
             if (code in 0x3040..0x309F) return true   // Hiragana

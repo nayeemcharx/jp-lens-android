@@ -43,7 +43,9 @@
       "Bash(awk ' *)",
       "Bash(unzip -l app/release/app-release.apk)",
       "Bash(awk 'NR>3 && $1 ~ /^[0-9]+$/ {print $1, $4}')",
-      "Bash(awk 'NR>3 && $1 ~ /^[0-9]+$/ {n=$4; sub\\(/\\\\/.*/,\"\",n\\); s[n]+=$1} END {for \\(k in s\\) printf \"%8.2f MB  %s\\\\n\", s[k]/1048576, k}')"
+      "Bash(awk 'NR>3 && $1 ~ /^[0-9]+$/ {n=$4; sub\\(/\\\\/.*/,\"\",n\\); s[n]+=$1} END {for \\(k in s\\) printf \"%8.2f MB  %s\\\\n\", s[k]/1048576, k}')",
+      "Bash(pip install *)",
+      "Bash(python3 -c \"import PIL; print\\('Pillow OK', PIL.__version__\\)\")"
     ]
   }
 }
