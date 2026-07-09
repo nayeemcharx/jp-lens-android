@@ -17,7 +17,9 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
@@ -28,10 +30,12 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -57,6 +61,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.nayeemcharx.jplens.ui.theme.JplensandroidTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
@@ -102,19 +107,96 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private val OK_COLOR = Color(0xFF2E7D32)
-private val PENDING_COLOR = Color(0xFFB26A00)
+// Status colors picked to stay readable on both the light and dark theme.
+private val OK_COLOR = Color(0xFF43A047)
+private val PENDING_COLOR = Color(0xFFEF6C00)
 
-/** A titled card section. */
+/** A titled card section, with an optional numbered step badge before the title. */
 @Composable
-private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+private fun SectionCard(
+    title: String,
+    badge: String? = null,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+        ),
+    ) {
         Column(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            modifier = Modifier.fillMaxWidth().padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                if (badge != null) {
+                    Box(
+                        modifier = Modifier
+                            .size(26.dp)
+                            .background(MaterialTheme.colorScheme.primaryContainer, CircleShape),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            badge,
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        )
+                    }
+                }
+                Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            }
             content()
+        }
+    }
+}
+
+/**
+ * Live session banner. [running] mirrors [OverlayService.isRunning] — the real
+ * service state (projection acquired), not an optimistic "start was pressed".
+ */
+@Composable
+private fun RunningStatusCard(running: Boolean) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (running) OK_COLOR.copy(alpha = 0.15f)
+            else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+        ),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(12.dp)
+                    .background(
+                        if (running) OK_COLOR
+                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f),
+                        CircleShape,
+                    ),
+            )
+            Column {
+                Text(
+                    if (running) "JP Lens is running" else "JP Lens is off",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (running) OK_COLOR else MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    if (running) "Tap the floating button to scan — hold it to switch modes or stop."
+                    else "Press Start to begin a capture session.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
@@ -255,6 +337,17 @@ fun PermissionFlow(
         modelState = if (ok) "present" else "missing"
     }
 
+    // Live service state. Polled (cheap volatile read, same process) so the
+    // banner tracks reality: the service acquiring the projection, failing to
+    // start, or being stopped later from the floating button's hold menu.
+    var serviceRunning by remember { mutableStateOf(OverlayService.isRunning) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            serviceRunning = OverlayService.isRunning
+            delay(500)
+        }
+    }
+
     val ankiPermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -287,7 +380,9 @@ fun PermissionFlow(
                 putExtra(OverlayService.EXTRA_MODE, pendingMode)
             }
             ContextCompat.startForegroundService(context, svc)
-            status = "JP Lens started — tap the floating button to capture text. hold it to switch mode or stop."
+            // No optimistic "started" text here — the Running banner flips only
+            // once the service actually acquires the projection.
+            status = ""
         } else {
             status = "Screen-capture permission denied."
         }
@@ -339,7 +434,7 @@ fun PermissionFlow(
         verticalArrangement = Arrangement.spacedBy(16.dp),
         horizontalAlignment = Alignment.Start,
     ) {
-        Spacer(modifier = Modifier.height(ButtonDefaults.MinHeight))
+        Spacer(modifier = Modifier.height(4.dp))
 
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -351,12 +446,12 @@ fun PermissionFlow(
                 factory = { ctx ->
                     ImageView(ctx).apply { setImageResource(R.mipmap.ic_launcher) }
                 },
-                modifier = Modifier.size(64.dp),
+                modifier = Modifier.size(72.dp),
             )
             Column {
                 Text("JP Lens", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
                 if (versionName.isNotBlank()) {
-                    Text("Version $versionName", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Version $versionName", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
@@ -366,8 +461,35 @@ fun PermissionFlow(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
+        // ── Live state + Start / Stop ────────────────────────────────
+        RunningStatusCard(serviceRunning)
+        Button(
+            onClick = { startCapture() },
+            modifier = Modifier.fillMaxWidth().height(54.dp),
+            shape = RoundedCornerShape(16.dp),
+        ) {
+            Text(
+                if (serviceRunning) "Restart" else "Start",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+        OutlinedButton(
+            onClick = {
+                context.startService(
+                    Intent(context, OverlayService::class.java).apply { action = OverlayService.ACTION_STOP }
+                )
+                status = ""
+            },
+            modifier = Modifier.fillMaxWidth().height(46.dp),
+            shape = RoundedCornerShape(16.dp),
+        ) { Text("Stop") }
+        if (status.isNotBlank()) {
+            Text(status, style = MaterialTheme.typography.bodyMedium, color = PENDING_COLOR)
+        }
+
         // ── Permissions ──────────────────────────────────────────────
-        SectionCard("1 · Permissions") {
+        SectionCard("Permissions", badge = "1") {
             StatusLine(overlayOk, if (overlayOk) "Draw over other apps — granted" else "Draw over other apps — required")
             if (!overlayOk) {
                 OutlinedButton(onClick = { openOverlaySettings() }) { Text("Grant overlay permission") }
@@ -382,7 +504,7 @@ fun PermissionFlow(
         }
 
         // ── Popup sections ───────────────────────────────────────────
-        SectionCard("2 · Popup sections") {
+        SectionCard("Popup sections", badge = "2") {
             Hint("Choose what appears when you tap a detected sentence.")
             ToggleLine("Reading (kana)", showReading) {
                 showReading = it
@@ -399,7 +521,7 @@ fun PermissionFlow(
         }
 
         // ── Offline translation model ────────────────────────────────
-        SectionCard("3 · Offline translation") {
+        SectionCard("Offline translation", badge = "3") {
             when (modelState) {
                 "present" -> {
                     StatusLine(true, "FuguMT translation model bundled — works fully offline, on-device.")
@@ -414,7 +536,7 @@ fun PermissionFlow(
         }
 
         // ── AnkiDroid ────────────────────────────────────────────────
-        SectionCard("4 · Add to AnkiDroid (optional)") {
+        SectionCard("Add to AnkiDroid (optional)", badge = "4") {
             EditableField(
                 label = "Deck name",
                 value = deckName,
@@ -441,37 +563,18 @@ fun PermissionFlow(
             Hint("The “+” (add card) button shows on overlay words only when this is fully set up.")
         }
 
-        // ── Start / Stop ─────────────────────────────────────────────
-        Button(onClick = { startCapture() }, modifier = Modifier.fillMaxWidth()) {
-            Text("Start")
+        // ── Tips ─────────────────────────────────────────────────────
+        SectionCard("Tips & notes") {
+            Hint("• When reading manga, use Crop Mode and capture one dialogue box at a time for the best results.")
+            Hint("• OCR capture quality depends entirely on your device's built-in OCR engine.")
+            Hint("• Offline translation has its limitations. Online translation services typically incur ongoing costs, so this free app currently uses offline translation only. Future versions may support optional online translation plugins.")
         }
-        OutlinedButton(
-            onClick = {
-                context.startService(
-                    Intent(context, OverlayService::class.java).apply { action = OverlayService.ACTION_STOP }
-                )
-                status = "Stopped."
-            },
-            modifier = Modifier.fillMaxWidth(),
-        ) { Text("Stop") }
-
-        if (status.isNotBlank()) {
-            val running = status.startsWith("JP Lens started")
-            Text(
-                status,
-                style = if (running) MaterialTheme.typography.titleMedium
-                        else MaterialTheme.typography.bodyMedium,
-                fontWeight = if (running) FontWeight.Bold else null,
-                color = if (running) OK_COLOR else Color.Unspecified,
-            )
-        }
-        Hint("Note: Offline translation has its limitations. Online translation services typically incur ongoing costs, so this free app currently uses offline translation only. Future versions may support optional online translation plugins.")
-        Hint("Note: OCR capture quality depends entirely on your device's built-in OCR engine.")
-        Hint("Tip: When reading manga, use Crop Mode and capture one dialogue box at a time for the best results.")
 
         TextButton(onClick = onAbout, modifier = Modifier.fillMaxWidth()) {
             Text("About & privacy")
         }
+
+        Spacer(modifier = Modifier.height(8.dp))
     }
 }
 
@@ -519,12 +622,12 @@ private fun AboutScreen(modifier: Modifier = Modifier, onBack: () -> Unit) {
                 factory = { ctx ->
                     ImageView(ctx).apply { setImageResource(R.mipmap.ic_launcher) }
                 },
-                modifier = Modifier.size(64.dp),
+                modifier = Modifier.size(72.dp),
             )
             Column {
                 Text("JP Lens", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
                 if (versionName.isNotBlank()) {
-                    Text("Version $versionName", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Version $versionName", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }

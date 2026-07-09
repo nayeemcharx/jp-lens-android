@@ -87,6 +87,12 @@ class OverlayService : Service() {
         const val PREF_SHOW_TRANSLATION = "show_translation"
         const val PREF_SHOW_DICTIONARY = "show_dictionary"
 
+        // True while a capture session is actually live (projection acquired,
+        // floating button up). Read by the home screen so its "Running" banner
+        // reflects reality — not merely that the consent dialog returned OK.
+        @Volatile var isRunning = false
+            private set
+
         // How long to hold the floating button before the radial mode menu appears.
         // Short (standard long-press); a drag past touchSlop cancels it, so a brief
         // hold-in-place is enough and won't interfere with dragging the button.
@@ -196,11 +202,11 @@ class OverlayService : Service() {
         // hidden and isProcessing stuck — drop the stale selector first.
         cancelCropSelector()
 
-        // A fresh capture session always starts in sentence (文) mode, regardless
+        // A fresh capture session always starts in full-screen (🔍) mode, regardless
         // of the last-used mode; the radial menu switches live after.
         mode = MODE_SENTENCE_DICT
         persistMode()
-        Log.i(TAG, "Starting mode=$mode (2=sentence, 4=crop)")
+        Log.i(TAG, "Starting mode=$mode (2=full screen, 4=crop)")
 
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
         val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -218,6 +224,13 @@ class OverlayService : Service() {
         val pm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = pm.getMediaProjection(resultCode, data).also {
             it?.registerCallback(projectionCallback, Handler(mainLooper))
+        }
+        if (mediaProjection == null) {
+            // Fail fast — otherwise we'd show a floating button that can never
+            // capture, while the home screen claims the session is running.
+            Log.e(TAG, "getMediaProjection returned null")
+            stopSelf()
+            return
         }
 
         captureThread = HandlerThread("JpLensCapture").also { it.start() }
@@ -243,6 +256,7 @@ class OverlayService : Service() {
 
         setupVirtualDisplay()
         showFloatingButton()
+        isRunning = true
     }
 
     /**
@@ -311,6 +325,22 @@ class OverlayService : Service() {
         windowManager.addView(button, params)
     }
 
+    /** Blends [color] toward white by [t] (0..1), keeping its alpha. */
+    private fun lighten(color: Int, t: Float): Int = Color.argb(
+        Color.alpha(color),
+        Color.red(color) + ((255 - Color.red(color)) * t).toInt(),
+        Color.green(color) + ((255 - Color.green(color)) * t).toInt(),
+        Color.blue(color) + ((255 - Color.blue(color)) * t).toInt(),
+    )
+
+    /** Scales [color] toward black by [t] (0..1), keeping its alpha. */
+    private fun darken(color: Int, t: Float): Int = Color.argb(
+        Color.alpha(color),
+        (Color.red(color) * (1 - t)).toInt(),
+        (Color.green(color) * (1 - t)).toInt(),
+        (Color.blue(color) * (1 - t)).toInt(),
+    )
+
     private fun updateOcrButtonAppearance() {
         val btn = floatingView as? Button ?: return
         // "Active" (tap clears) when boxes are showing, or when a crop-mode popup
@@ -319,22 +349,27 @@ class OverlayService : Service() {
         btn.text = when {
             active -> "✕"
             mode == MODE_CROP -> "✂"
-            else -> "文"
+            else -> "🔍"
         }
-        btn.background = GradientDrawable().apply {
+        btn.textSize = if (active) 18f else 20f
+        val base = when {
+            active -> Color.argb(235, 220, 80, 60)
+            mode == MODE_CROP -> Color.argb(230, 230, 140, 40)
+            else -> Color.argb(230, 40, 160, 120)
+        }
+        // Soft top-lit gradient + hairline ring so the button reads as a floating
+        // "lens" instead of a flat disc.
+        btn.background = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(lighten(base, 0.30f), darken(base, 0.18f))
+        ).apply {
             if (active) {
                 shape = GradientDrawable.RECTANGLE
-                cornerRadius = dp(10).toFloat()
-                setColor(Color.argb(230, 220, 80, 60))
+                cornerRadius = dp(14).toFloat()
             } else {
                 shape = GradientDrawable.OVAL
-                setColor(
-                    when (mode) {
-                        MODE_CROP -> Color.argb(220, 230, 140, 40)
-                        else -> Color.argb(220, 40, 160, 120)
-                    }
-                )
             }
+            setStroke(dp(2), Color.argb(90, 255, 255, 255))
         }
     }
 
@@ -456,7 +491,7 @@ class OverlayService : Service() {
             Translator.warmUp(this)
         }
         updateOcrButtonAppearance()
-        val name = if (newMode == MODE_CROP) "crop" else "sentence"
+        val name = if (newMode == MODE_CROP) "Crop" else "Full screen"
         Toast.makeText(this, "Mode: $name", Toast.LENGTH_SHORT).show()
     }
 
@@ -490,15 +525,33 @@ class OverlayService : Service() {
     private fun showRadialMenu(btnParams: WindowManager.LayoutParams) {
         if (radialMenu != null) return
         val btnSize = dp(64)
-        val cx = btnParams.x + btnSize / 2
-        val cy = btnParams.y + btnSize / 2
-        val metrics = resources.displayMetrics
+        // Fan out from where the button *actually* is on screen (the system can
+        // inset a window away from a display cutout, so the requested params.x/y
+        // aren't guaranteed to be its real position).
+        val btnView = floatingView
+        val cx: Int
+        val cy: Int
+        if (btnView != null && btnView.isAttachedToWindow) {
+            val loc = IntArray(2)
+            btnView.getLocationOnScreen(loc)
+            cx = loc[0] + btnView.width / 2
+            cy = loc[1] + btnView.height / 2
+        } else {
+            cx = btnParams.x + btnSize / 2
+            cy = btnParams.y + btnSize / 2
+        }
+        // Real (full physical) metrics — resources.displayMetrics can exclude the
+        // status/navigation-bar areas on some OEMs, which skewed the option
+        // clamping and made the circles bunch up near screen edges.
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(metrics)
         val screenW = metrics.widthPixels
         val screenH = metrics.heightPixels
 
         val options = buildList {
-            add(MenuOption("文", Color.argb(235, 40, 160, 120),
-                "Sentence Mode\nTap the floating button to detect Japanese text, then tap a detected text box to view a full analysis.") { setMode(MODE_SENTENCE_DICT) })
+            add(MenuOption("🔍", Color.argb(235, 40, 160, 120),
+                "Full Screen Mode\nTap the floating button to detect Japanese text anywhere on screen, then tap a detected text box to view a full analysis.") { setMode(MODE_SENTENCE_DICT) })
             add(MenuOption("✂", Color.argb(235, 230, 140, 40),
                 "Crop Mode\nTap the floating button, then drag a box around the area you want to scan. Only the selected area will be processed.") { setMode(MODE_CROP) })
             add(MenuOption("Stop", Color.argb(235, 220, 80, 60),
@@ -527,7 +580,10 @@ class OverlayService : Service() {
             val view = TextView(this).apply {
                 text = opt.label
                 setTextColor(Color.WHITE)
-                textSize = 14f
+                // Glyph options (🔍 / ✂) read best big; the "Stop" word needs to
+                // fit inside the same circle.
+                textSize = if (opt.label.length <= 2) 19f else 13f
+                setTypeface(typeface, Typeface.BOLD)
                 gravity = Gravity.CENTER
                 background = optionDrawable(opt.color, selected = false)
                 elevation = dp(4).toFloat()
@@ -572,9 +628,13 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         else
             @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+        // Sized to the real metrics at the physical origin (like the crop selector
+        // and box overlay) — NOT MATCH_PARENT. A MATCH_PARENT window without a
+        // cutout mode gets inset below a punch-hole cutout (e.g. Redmi/Xiaomi),
+        // which shifted every option circle down relative to the button and made
+        // the fan look lopsided.
         val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
+            metrics.widthPixels, metrics.heightPixels,
             type,
             // NOT_TOUCHABLE — the floating button owns the gesture and drives
             // selection; the menu is purely visual. NO_LIMITS so it shares the
@@ -585,7 +645,15 @@ class OverlayService : Service() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.START }
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
 
         try {
             windowManager.addView(scrim, params)
@@ -602,10 +670,13 @@ class OverlayService : Service() {
 
     /** Oval option background; gains a white ring when it's the hovered option. */
     private fun optionDrawable(color: Int, selected: Boolean): GradientDrawable =
-        GradientDrawable().apply {
+        GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(lighten(color, 0.28f), darken(color, 0.15f))
+        ).apply {
             shape = GradientDrawable.OVAL
-            setColor(color)
             if (selected) setStroke(dp(3), Color.WHITE)
+            else setStroke(dp(1), Color.argb(70, 255, 255, 255))
         }
 
     /**
@@ -2589,6 +2660,7 @@ class OverlayService : Service() {
     }
 
     override fun onDestroy() {
+        isRunning = false
         cancelCropSelector()
         clearSentenceBoxes()
         dismissRadialMenu()
