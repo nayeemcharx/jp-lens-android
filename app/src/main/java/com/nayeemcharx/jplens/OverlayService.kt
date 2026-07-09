@@ -498,13 +498,12 @@ class OverlayService : Service() {
 
         val options = buildList {
             add(MenuOption("文", Color.argb(235, 40, 160, 120),
-                "Sentence mode\nClick on the floating button to detect Japanese sentences, then click on the boxes to get the full analysis.") { setMode(MODE_SENTENCE_DICT) })
+                "Sentence Mode\nTap the floating button to detect Japanese text, then tap a detected text box to view a full analysis.") { setMode(MODE_SENTENCE_DICT) })
             add(MenuOption("✂", Color.argb(235, 230, 140, 40),
-                "Crop mode\nClick on the floating button, then drag a box over the area you want — only that area is scanned for Japanese text.") { setMode(MODE_CROP) })
+                "Crop Mode\nTap the floating button, then drag a box around the area you want to scan. Only the selected area will be processed.") { setMode(MODE_CROP) })
             add(MenuOption("Stop", Color.argb(235, 220, 80, 60),
-                "Stop\nClose the overlay and stop capturing.") { stopSelf() })
+                "Stop\nClose the overlay and stop screen capture.") { stopSelf() })
         }
-
         val scrim = FrameLayout(this).apply {
             setBackgroundColor(Color.argb(110, 0, 0, 0))
         }

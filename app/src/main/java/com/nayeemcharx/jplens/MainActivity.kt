@@ -21,13 +21,16 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -209,6 +212,7 @@ fun PermissionFlow(
     resumeTick: Int = 0,
     onAbout: () -> Unit = {},
 ) {
+
     val context = LocalContext.current
     var status by remember { mutableStateOf("") }
 
@@ -229,7 +233,11 @@ fun PermissionFlow(
     var showDictionary by remember {
         mutableStateOf(prefs.getBoolean(OverlayService.PREF_SHOW_DICTIONARY, true))
     }
-
+    val versionName = remember {
+        runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull().orEmpty()
+    }
     // Re-read on each resume so returning from settings reflects the new state.
     val overlayOk = remember(resumeTick) { Settings.canDrawOverlays(context) }
     val notifOk = remember(resumeTick) {
@@ -331,7 +339,27 @@ fun PermissionFlow(
         verticalArrangement = Arrangement.spacedBy(16.dp),
         horizontalAlignment = Alignment.Start,
     ) {
-        Text("JP Lens", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        Spacer(modifier = Modifier.height(ButtonDefaults.MinHeight))
+
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            // ImageView (not painterResource) so the adaptive launcher icon renders/masks correctly.
+            AndroidView(
+                factory = { ctx ->
+                    ImageView(ctx).apply { setImageResource(R.mipmap.ic_launcher) }
+                },
+                modifier = Modifier.size(64.dp),
+            )
+            Column {
+                Text("JP Lens", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                if (versionName.isNotBlank()) {
+                    Text("Version $versionName", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
         Text(
             "Floating Japanese OCR — tap text on screen for dictionary, readings & translation.",
             style = MaterialTheme.typography.bodyMedium,
@@ -437,9 +465,9 @@ fun PermissionFlow(
                 color = if (running) OK_COLOR else Color.Unspecified,
             )
         }
-        Hint("Note: offline translation isn't perfect, but it's usually enough to get the meaning across. A future release may add an opt-in for online translation APIs.")
+        Hint("Note: Offline translation has its limitations. Online translation services typically incur ongoing costs, so this free app currently uses offline translation only. Future versions may support optional online translation plugins.")
         Hint("Note: OCR capture quality depends entirely on your device's built-in OCR engine.")
-        Hint("Tip: manga panels can sometimes mix up alignments or fail to detect text — if detection looks off, zoom in on the panel and try again. It might give a better result :)")
+        Hint("Tip: When reading manga, use Crop Mode and capture one dialogue box at a time for the best results.")
 
         TextButton(onClick = onAbout, modifier = Modifier.fillMaxWidth()) {
             Text("About & privacy")
