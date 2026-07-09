@@ -12,8 +12,11 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.text.Spannable
@@ -144,8 +147,11 @@ class OverlayService : Service() {
         val sentenceId: Int,    // shared across all box pieces of the same sentence
         val fullText: String,   // full sentence text (may span multiple line-pieces)
     )
-    private data class RenderedSentenceBox(val view: View, val box: SentenceBox)
-    private val renderedSentenceBoxes = mutableListOf<RenderedSentenceBox>()
+    // ALL sentence boxes are drawn by this single fullscreen overlay window
+    // (one canvas + hit-testing) — never one window per box: each overlay window
+    // costs its own surface/ViewRootImpl, so hundreds of boxes crashed low-RAM
+    // devices and visibly appeared/disappeared one at a time.
+    private var sentenceBoxOverlay: SentenceBoxOverlayView? = null
 
     private var mode: Int = MODE_SENTENCE_DICT
 
@@ -309,7 +315,7 @@ class OverlayService : Service() {
         val btn = floatingView as? Button ?: return
         // "Active" (tap clears) when boxes are showing, or when a crop-mode popup
         // is open without boxes.
-        val active = renderedSentenceBoxes.isNotEmpty() || popup != null
+        val active = sentenceBoxOverlay != null || popup != null
         btn.text = when {
             active -> "✕"
             mode == MODE_CROP -> "✂"
@@ -745,7 +751,7 @@ class OverlayService : Service() {
         // Toggle: if any overlay is showing, just clear it. (A crop-mode popup has
         // no boxes, so check it separately — it must also be gone before the next
         // snapshot, or it would be captured into it.)
-        if (renderedSentenceBoxes.isNotEmpty()) {
+        if (sentenceBoxOverlay != null) {
             clearSentenceBoxes()
             return
         }
@@ -1168,14 +1174,15 @@ class OverlayService : Service() {
     }
 
     /**
-     * Hides/shows the transparent sentence boxes while the analysis popup is
-     * open, so the popup is the only overlay on screen. The box windows are kept
-     * alive — this only flips view visibility, so it costs nothing (no re-OCR,
-     * no re-layout) and the boxes come back instantly when the popup closes.
+     * Hides/shows the sentence-box overlay while the analysis popup is open, so
+     * the popup is the only overlay on screen. The window is kept alive — this
+     * only flips view visibility, so it costs nothing (no re-OCR, no re-layout)
+     * and the boxes come back instantly when the popup closes. An INVISIBLE
+     * window also receives no input, so touches outside the popup pass through
+     * to the app below while it's hidden.
      */
     private fun setSentenceBoxesVisible(visible: Boolean) {
-        val v = if (visible) View.VISIBLE else View.INVISIBLE
-        for (rb in renderedSentenceBoxes) rb.view.visibility = v
+        sentenceBoxOverlay?.visibility = if (visible) View.VISIBLE else View.INVISIBLE
     }
 
     /**
@@ -1799,7 +1806,9 @@ class OverlayService : Service() {
 
     /**
      * Splits OCR output into sentence-level boxes. Lines are walked in reading
-     * order within each block; pieces between Japanese terminators (。！？!?) get
+     * order within each reading unit (see [readingUnits] — a horizontal block,
+     * or a right-to-left run of adjacent vertical columns that ML Kit split
+     * into separate blocks); pieces between Japanese terminators (。！？!?) get
      * grouped into one logical sentence even when split across lines. Each
      * physical line-piece becomes its own clickable rectangle; all pieces of the
      * same sentence carry the same fullText (and same sentenceId) so any click
@@ -1810,12 +1819,7 @@ class OverlayService : Service() {
         val out = mutableListOf<SentenceBox>()
         var sid = 0
 
-        for (block in visionText.textBlocks) {
-            val vert = isBlockVertical(block)
-            val orderedLines = if (vert) {
-                block.lines.sortedByDescending { it.boundingBox?.centerX() ?: 0 }
-            } else block.lines
-
+        for (orderedLines in readingUnits(visionText)) {
             data class Piece(val rect: android.graphics.Rect, val text: String)
             var pendingPieces = mutableListOf<Piece>()
             val pendingText = StringBuilder()
@@ -1871,63 +1875,242 @@ class OverlayService : Service() {
                     }
                 }
             }
-            // End of block — flush any sentence that lacked a terminator.
+            // End of reading unit — flush any sentence that lacked a terminator.
             flushSentence()
         }
         return out
     }
 
+    /**
+     * Groups ML Kit blocks into "reading units" — line lists a sentence is
+     * allowed to flow through. A horizontal block maps to one unit as-is, but
+     * multi-column tategaki usually comes back as *one block per column* (tall
+     * narrow blocks separated by clean gaps read as separate paragraphs to
+     * ML Kit), and its block order is ~left-to-right — the reverse of vertical
+     * reading order. So adjacent vertical blocks (columns with substantial
+     * vertical overlap, separated by no more than ~1.5 column widths) are
+     * merged into one unit with all their lines re-sorted right-to-left (ties
+     * top-to-bottom), letting [computeSentenceBoxes] continue a sentence
+     * across columns instead of flushing at every block edge. The gap guard
+     * keeps unrelated vertical text (a neighboring bubble/panel) from being
+     * glued into the same sentence.
+     */
+    private fun readingUnits(visionText: Text): List<List<Text.Line>> {
+        val units = mutableListOf<List<Text.Line>>()
+        val vertBlocks = mutableListOf<Text.TextBlock>()
+        for (block in visionText.textBlocks) {
+            if (isBlockVertical(block)) vertBlocks += block else units += block.lines
+        }
+        if (vertBlocks.isEmpty()) return units
+
+        // Median line width ≈ column width — the yardstick for how far apart
+        // two columns of the same paragraph can plausibly be.
+        val colWidth = vertBlocks.map { block ->
+            val widths = block.lines.mapNotNull { it.boundingBox?.width() }.sorted()
+            if (widths.isEmpty()) 0 else widths[widths.size / 2]
+        }
+        val boxes = vertBlocks.map { it.boundingBox }
+
+        fun sameColumnRun(i: Int, j: Int): Boolean {
+            val a = boxes[i] ?: return false
+            val b = boxes[j] ?: return false
+            val overlap = min(a.bottom, b.bottom) - max(a.top, b.top)
+            if (overlap < 0.5f * min(a.height(), b.height())) return false
+            val gap = max(a.left, b.left) - min(a.right, b.right)
+            val w = min(colWidth[i], colWidth[j])
+            return w > 0 && gap <= 1.5f * w
+        }
+
+        // Union-find over the (few) vertical blocks; transitive merging chains
+        // a whole run even when only neighboring columns are pairwise close.
+        val parent = IntArray(vertBlocks.size) { it }
+        fun find(x: Int): Int {
+            var r = x
+            while (parent[r] != r) r = parent[r]
+            return r
+        }
+        for (i in vertBlocks.indices) {
+            for (j in i + 1 until vertBlocks.size) {
+                if (sameColumnRun(i, j)) parent[find(j)] = find(i)
+            }
+        }
+
+        for (members in vertBlocks.indices.groupBy { find(it) }.values) {
+            units += members.flatMap { vertBlocks[it].lines }
+                .sortedWith(
+                    compareByDescending<Text.Line> { it.boundingBox?.centerX() ?: 0 }
+                        .thenBy { it.boundingBox?.top ?: 0 }
+                )
+        }
+        return units
+    }
+
+    /**
+     * A single fullscreen view that draws ALL sentence boxes and hit-tests taps
+     * itself. One overlay window total, no matter how much text is on screen —
+     * one window *per box* meant one surface + ViewRootImpl + synchronous
+     * WindowManager IPC each, which crashed graphics-memory-starved devices on
+     * dense pages and made boxes visibly appear/disappear one at a time.
+     *
+     * Touch semantics: tap a box → analysis popup; tap or swipe anywhere else →
+     * dismiss the boxes (the fullscreen window necessarily consumes the touch, so
+     * it can't be passed through to the app below — but the boxes are stale the
+     * moment the underlying content moves anyway, and the change-watcher would
+     * have cleared them).
+     */
+    private inner class SentenceBoxOverlayView(context: Context) : View(context) {
+        private var boxes: List<SentenceBox> = emptyList()
+        private var rects: List<RectF> = emptyList()  // padded, in screen px
+        private val padY = dp(3).toFloat()
+        private val corner = dp(3).toFloat()
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.argb(48, 140, 120, 240)
+        }
+        private val pressedFillPaint = Paint(fillPaint).apply {
+            color = Color.argb(110, 140, 120, 240)
+        }
+        private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = dp(2).toFloat()
+            color = Color.argb(255, 140, 120, 240)
+        }
+        private val touchSlop = dp(8)
+        private var pressedIndex = -1
+        private var downX = 0f
+        private var downY = 0f
+
+        fun setBoxes(newBoxes: List<SentenceBox>) {
+            boxes = newBoxes
+            rects = newBoxes.map {
+                RectF(
+                    it.left.toFloat(), it.top - padY,
+                    (it.left + it.width).toFloat(), it.top + it.height + padY
+                )
+            }
+            pressedIndex = -1
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            for (i in rects.indices) {
+                val r = rects[i]
+                canvas.drawRoundRect(r, corner, corner,
+                    if (i == pressedIndex) pressedFillPaint else fillPaint)
+                canvas.drawRoundRect(r, corner, corner, strokePaint)
+            }
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            // The window normally sits at the physical origin, so view coords ==
+            // screen coords; add the actual offset in case the system inset the
+            // window (same defensive mapping as the crop selector).
+            val loc = IntArray(2)
+            getLocationOnScreen(loc)
+            val x = event.x + loc[0]
+            val y = event.y + loc[1]
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.x
+                    downY = event.y
+                    pressedIndex = rects.indexOfFirst { it.contains(x, y) }
+                    if (pressedIndex < 0) {
+                        // Empty area — the tap dismisses the boxes.
+                        clearSentenceBoxes()
+                    } else {
+                        invalidate()
+                    }
+                    return true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (pressedIndex >= 0 &&
+                        (abs(event.x - downX) > touchSlop || abs(event.y - downY) > touchSlop)
+                    ) {
+                        // A drag, not a tap — treat like an empty-area touch.
+                        pressedIndex = -1
+                        clearSentenceBoxes()
+                    }
+                    return true
+                }
+                MotionEvent.ACTION_UP -> {
+                    val i = pressedIndex
+                    pressedIndex = -1
+                    invalidate()
+                    if (i >= 0 && i < boxes.size) {
+                        performClick()
+                        onSentenceClick(boxes[i])
+                    }
+                    return true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    pressedIndex = -1
+                    invalidate()
+                    return true
+                }
+            }
+            return super.onTouchEvent(event)
+        }
+    }
+
     private fun renderSentenceBoxes(boxes: List<SentenceBox>) {
         clearSentenceBoxes()
+        if (boxes.isEmpty()) return
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         else
             @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
-        val padY = dp(3)
-        for (b in boxes) {
-            val view = View(this).apply {
-                background = makeSentenceBoxDrawable()
-                isClickable = true
-                setOnClickListener { onSentenceClick(b) }
-            }
-            val params = WindowManager.LayoutParams(
-                b.width, b.height + padY * 2,
-                type,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.START
-                x = b.left
-                y = b.top - padY
-            }
-            try {
-                windowManager.addView(view, params)
-                renderedSentenceBoxes += RenderedSentenceBox(view, b)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to add sentence box view", e)
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(metrics)
+        val view = SentenceBoxOverlayView(this).apply { setBoxes(boxes) }
+        // Sized to the real metrics at the physical origin (IN_SCREEN + NO_LIMITS)
+        // so canvas coords line up 1:1 with the OCR pixel coords.
+        val params = WindowManager.LayoutParams(
+            metrics.widthPixels, metrics.heightPixels,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             }
         }
-        Log.i(TAG, "Rendered ${renderedSentenceBoxes.size} sentence boxes")
+        try {
+            windowManager.addView(view, params)
+            sentenceBoxOverlay = view
+            // The fullscreen overlay was just added ABOVE the floating button
+            // (same window type, later add = higher z) and would swallow its
+            // touches — re-add the button so it stays on top and keeps its
+            // tap / drag / hold-menu gestures while boxes are showing.
+            raiseFloatingButton()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to add sentence box overlay", e)
+        }
+        Log.i(TAG, "Rendered ${boxes.size} sentence boxes in one overlay window")
         updateOcrButtonAppearance()
-        if (renderedSentenceBoxes.isNotEmpty()) startChangeWatch()
+        if (sentenceBoxOverlay != null) startChangeWatch()
     }
 
-    private fun makeSentenceBoxDrawable(): GradientDrawable = GradientDrawable().apply {
-        setStroke(dp(2), Color.argb(255, 140, 120, 240))
-        setColor(Color.argb(48, 140, 120, 240))
-        cornerRadius = dp(3).toFloat()
+    /** Re-adds the floating button so it z-orders above a just-added overlay. */
+    private fun raiseFloatingButton() {
+        val btn = floatingView ?: return
+        val lp = btn.layoutParams as? WindowManager.LayoutParams ?: return
+        runCatching { windowManager.removeView(btn) }
+        runCatching { windowManager.addView(btn, lp) }
     }
 
     private fun clearSentenceBoxes() {
         stopChangeWatch()
         dismissPopup()
-        for (rb in renderedSentenceBoxes) {
-            runCatching { windowManager.removeView(rb.view) }
-        }
-        renderedSentenceBoxes.clear()
+        sentenceBoxOverlay?.let { runCatching { windowManager.removeView(it) } }
+        sentenceBoxOverlay = null
         updateOcrButtonAppearance()
     }
 
