@@ -2617,6 +2617,13 @@ class OverlayService : Service() {
             // Extra line spacing leaves room for the per-morpheme underlines below
             // the baseline (drawn by SentenceTextView) and keeps taps comfortable.
             setLineSpacing(dp(6).toFloat(), 1f)
+            // Bottom padding so the LAST line's underline/chip (drawn ~5dp below the
+            // baseline) isn't clipped by the view bounds — Android drops the last
+            // line's spacingAdd from the layout height, and on some fonts (e.g. the
+            // Redmi system font) the descent alone is smaller than underlineDrop, so
+            // without this the final line's underlines vanish. Small top padding too
+            // so the first line's chip has headroom.
+            setPadding(0, dp(2), 0, dp(6))
         }
         val titleRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
