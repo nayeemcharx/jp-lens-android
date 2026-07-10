@@ -43,7 +43,13 @@ object JmDict {
     //    the APK small — same schema; see scripts/build_jmdict_db.py --lite / --shrink.
     // v5: back to the *full* db (~98 MB, all ~217k words) — same schema; forces installs
     //    holding the lite db to re-copy. Built with `python3 scripts/build_jmdict_db.py`.
-    private const val DB_ASSET_VERSION = 5
+    // v6: (short-lived) lite db to save space.
+    // v7: (short-lived) full db + a Kuromoji user dictionary (both since removed).
+    // v8: *reachability-pruned* full db (~43 MB, ~98k words) — same schema; keeps only
+    //    words plain IPADIC can actually emit as a token (the rest could never be looked
+    //    up), so no visible gloss is lost, unlike the frequency-based lite build. Built
+    //    with `python3 scripts/prune_jmdict_unreachable.py`. Forces older installs to re-copy.
+    private const val DB_ASSET_VERSION = 8
     private const val PREF_COPIED_VERSION = "jmdict_db_copied_version"
 
     @Volatile private var db: SQLiteDatabase? = null

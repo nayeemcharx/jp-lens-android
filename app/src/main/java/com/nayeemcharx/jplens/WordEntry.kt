@@ -1,9 +1,9 @@
 package com.nayeemcharx.jplens
 
 /**
- * One row of the sentence-mode Word-by-word section, shared by the dict-mode popup
- * and the Anki "+" button. (Formerly nested in AnthropicClient, which was removed
- * along with the optional LLM mode.)
+ * A single glossed word — the header of a tapped word's detail card in the popup,
+ * and the payload for the Anki "+" button. (Formerly nested in AnthropicClient,
+ * which was removed along with the optional LLM mode.)
  */
 data class WordEntry(
     val word: String,    // dictionary/lookup form — keys JMdict detail + Anki front

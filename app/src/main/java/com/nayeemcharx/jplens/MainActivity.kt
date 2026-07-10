@@ -213,7 +213,7 @@ private fun StatusLine(ok: Boolean, text: String) {
     }
 }
 
-/** A label + switch row for the popup-section toggles. */
+/** A label + switch row for the breakdown-section toggles. */
 @Composable
 private fun ToggleLine(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
     Row(
@@ -305,15 +305,15 @@ fun PermissionFlow(
         mutableStateOf(prefs.getString(OverlayService.PREF_ANKI_DECK, "JP Lens") ?: "JP Lens")
     }
 
-    // Which sections the sentence popup shows (read live by OverlayService on each tap).
+    // Which sections the breakdown shows (read live by OverlayService on each tap).
     var showReading by remember {
         mutableStateOf(prefs.getBoolean(OverlayService.PREF_SHOW_READING, true))
     }
+    var showRomaji by remember {
+        mutableStateOf(prefs.getBoolean(OverlayService.PREF_SHOW_ROMAJI, true))
+    }
     var showTranslation by remember {
         mutableStateOf(prefs.getBoolean(OverlayService.PREF_SHOW_TRANSLATION, true))
-    }
-    var showDictionary by remember {
-        mutableStateOf(prefs.getBoolean(OverlayService.PREF_SHOW_DICTIONARY, true))
     }
     val versionName = remember {
         runCatching {
@@ -503,20 +503,20 @@ fun PermissionFlow(
             Hint("Screen-capture access is requested each time you press Start (system prompt).")
         }
 
-        // ── Popup sections ───────────────────────────────────────────
-        SectionCard("Popup sections", badge = "2") {
-            Hint("Choose what appears when you tap a detected sentence.")
+        // ── Breakdown sections ───────────────────────────────────────
+        SectionCard("Breakdown", badge = "2") {
+            Hint("Tap any underlined word in the sentence for its dictionary entry. These toggles add whole-sentence sections below it.")
             ToggleLine("Reading (kana)", showReading) {
                 showReading = it
                 prefs.edit().putBoolean(OverlayService.PREF_SHOW_READING, it).apply()
             }
+            ToggleLine("Romaji", showRomaji) {
+                showRomaji = it
+                prefs.edit().putBoolean(OverlayService.PREF_SHOW_ROMAJI, it).apply()
+            }
             ToggleLine("Translation", showTranslation) {
                 showTranslation = it
                 prefs.edit().putBoolean(OverlayService.PREF_SHOW_TRANSLATION, it).apply()
-            }
-            ToggleLine("Dictionary (word-by-word)", showDictionary) {
-                showDictionary = it
-                prefs.edit().putBoolean(OverlayService.PREF_SHOW_DICTIONARY, it).apply()
             }
         }
 
@@ -525,7 +525,7 @@ fun PermissionFlow(
             when (modelState) {
                 "present" -> {
                     StatusLine(true, "FuguMT translation model bundled — works fully offline, on-device.")
-                    Hint("Used for the popup's Translation section.")
+                    Hint("Used for the breakdown's Translation section.")
                 }
                 "missing" -> {
                     StatusLine(false, "Translation model not built into this APK.")
@@ -673,7 +673,7 @@ private fun AboutScreen(modifier: Modifier = Modifier, onBack: () -> Unit) {
             )
             Text("Permissions used", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Text(
-                "• Draw over other apps — to show the floating button and overlay boxes/popups.\n" +
+                "• Draw over other apps — to show the floating button, overlay boxes and the breakdown card.\n" +
                     "• Screen capture (asked each session) — to read text on screen.\n" +
                     "• Notifications — for the required “capture active” foreground-service notice.\n" +
                     "• AnkiDroid access (optional) — to add flashcards.",

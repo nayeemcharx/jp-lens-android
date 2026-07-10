@@ -21,6 +21,8 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.text.Spannable
 import android.text.SpannableStringBuilder
+import android.text.method.LinkMovementMethod
+import android.text.style.ClickableSpan
 import android.text.style.ForegroundColorSpan
 import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
@@ -82,10 +84,13 @@ class OverlayService : Service() {
         const val PREF_ANKI_DECK = "anki_deck_name"
         // Last capture mode chosen (start button resumes it; radial menu updates it).
         const val PREF_LAST_MODE = "last_mode"
-        // Sentence-popup section toggles (set on the home screen; all default on).
+        // Whole-sentence popup section toggles (set on the home screen; both default
+        // on). The per-word dictionary is always available via the tappable sentence,
+        // so it has no toggle. ("show_dictionary" is a retired key — the old
+        // Word-by-word toggle — deliberately not reused.)
         const val PREF_SHOW_READING = "show_reading"
+        const val PREF_SHOW_ROMAJI = "show_romaji"
         const val PREF_SHOW_TRANSLATION = "show_translation"
-        const val PREF_SHOW_DICTIONARY = "show_dictionary"
 
         // True while a capture session is actually live (projection acquired,
         // floating button up). Read by the home screen so its "Running" banner
@@ -134,7 +139,7 @@ class OverlayService : Service() {
     private val changeGrid = 12
     private val changeThreshold = 48
 
-    private data class PopupHolder(val view: View, val translationView: TextView)
+    private data class PopupHolder(val view: View)
     private var popup: PopupHolder? = null
     // Set by the analysis popup's drag handler; suppresses auto-reposition so a
     // user-positioned popup doesn't jump when its content fills in.
@@ -236,15 +241,15 @@ class OverlayService : Service() {
         captureThread = HandlerThread("JpLensCapture").also { it.start() }
         captureHandler = Handler(captureThread!!.looper)
 
-        // Warm the Sudachi dictionary off the main thread so the first OCR tap is snappy.
+        // Warm the Kuromoji dictionary off the main thread so the first OCR tap is snappy.
         captureHandler?.post {
             val t0 = System.currentTimeMillis()
             JapaneseTokenizer.warmUp(this)
-            Log.i(TAG, "Sudachi warm-up: ${System.currentTimeMillis() - t0} ms (available=${JapaneseTokenizer.isAvailable()})")
+            Log.i(TAG, "Kuromoji warm-up: ${System.currentTimeMillis() - t0} ms (available=${JapaneseTokenizer.isAvailable()})")
         }
-        // Both modes use the offline JMdict SQLite asset (word-by-word section)
-        // and the offline FuguMT translator (Translation section), so warm both
-        // up front.
+        // Both modes use the offline JMdict SQLite asset (the tappable-word
+        // dictionary) and the offline FuguMT translator (Translation section), so
+        // warm both up front.
         captureHandler?.post {
             val t0 = System.currentTimeMillis()
             JmDict.warmUp(this)
@@ -1292,15 +1297,15 @@ class OverlayService : Service() {
     // ───────────────────────── Sentence mode (dict) ─────────────────────────
 
     /**
-     * Build one row of the Word-by-word section: word text on the left, a small
-     * "+" button on the right that adds the word to AnkiDroid as a card.
+     * The header row of a tapped word's detail card: a leading "+" Add-to-Anki
+     * button (when AnkiDroid is configured) followed by the word label
+     * (`surface (reading) — meaning  [JLPT]`). The full JMdict/KANJIDIC2 detail is
+     * rendered separately by [renderWordDetail] and stacked below this row.
      */
     private fun buildWordRow(
         entry: WordEntry,
-        textMaxW: Int,
         sentence: String,
         translation: String,
-        expandable: Boolean = false,
     ): View {
         // Show the surface (the text as it appears in the sentence) when we have it,
         // falling back to the lookup/word form when no surface was set.
@@ -1317,8 +1322,7 @@ class OverlayService : Service() {
         // permission is granted, and a deck name is set (configured on the home screen).
         val showAnki = AnkiDroidHelper.isConfigured(this)
         // The label is weighted (0dp + weight 1), so it wraps inside whatever space
-        // the fixed-width row leaves after the "+" and the chevron — and the chevron
-        // stays pinned at the row's right edge on every row.
+        // the fixed-width row leaves after the leading "+" button.
         val label = TextView(this).apply {
             text = labelText
             setTextColor(Color.argb(255, 230, 230, 230))
@@ -1358,84 +1362,10 @@ class OverlayService : Service() {
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
             ))
         }
-
-        if (!expandable) return row
-
-        // Expandable variant (dict mode): a chevron toggles a detail panel that
-        // lazily loads the full JMdict entry for this word.
-        val chevron = TextView(this).apply {
-            text = "▸"
-            setTextColor(Color.argb(255, 150, 200, 255))
-            textSize = 16f
-            setPadding(dp(10), dp(2), dp(6), dp(2))
-            isClickable = true
-            contentDescription = "Show dictionary details"
-        }
-        row.addView(chevron, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { leftMargin = dp(4) })
-
-        val detail = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            // Indent under the word, leaving a touch of left padding.
-            setPadding(dp(12), 0, 0, dp(4))
-        }
-        // Note: expand/collapse doesn't re-anchor the popup — it grows downward in
-        // place (no sideways jumps; width is fixed). If the growth would push it
-        // past the bottom edge, the popup window's layout listener clamps it back
-        // on-screen (see buildAnalysisPopup).
-        var loaded = false
-        chevron.setOnClickListener {
-            if (detail.visibility == View.VISIBLE) {
-                detail.visibility = View.GONE
-                chevron.text = "▸"
-                return@setOnClickListener
-            }
-            detail.visibility = View.VISIBLE
-            chevron.text = "▾"
-            if (!loaded) {
-                loaded = true
-                detail.removeAllViews()
-                detail.addView(TextView(this).apply {
-                    text = "Loading…"
-                    setTextColor(Color.argb(255, 160, 160, 160))
-                    textSize = 12f
-                })
-                Thread {
-                    val details = JmDict.lookupWordDetail(entry.word)
-                    val kanji = kanjiInfoForWord(entry.word)
-                    mainHandler.post {
-                        detail.removeAllViews()
-                        if (details.isEmpty() && kanji.isEmpty()) {
-                            detail.addView(TextView(this).apply {
-                                text = "(no dictionary entry)"
-                                setTextColor(Color.argb(255, 160, 160, 160))
-                                textSize = 12f
-                            })
-                        } else {
-                            detail.addView(renderWordDetail(details, kanji, textMaxW))
-                        }
-                    }
-                }.start()
-            }
-        }
-
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(row, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-            addView(detail, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-        }
+        return row
     }
 
-    // Colors for the expandable JMdict detail panel.
+    // Colors for the tapped-word JMdict detail panel.
     private val cAccent = Color.argb(255, 180, 220, 255)   // labels / sense numbers
     private val cBody = Color.argb(255, 235, 235, 235)     // glosses
     private val cPos = Color.argb(255, 150, 205, 150)      // part of speech
@@ -1605,6 +1535,277 @@ class OverlayService : Service() {
             maxWidth = maxW
             setPadding(0, topPad, 0, dp(3))
         }
+
+    // ─────────────────────── Interactive sentence ──────────────────────────
+    // One tappable morpheme in the popup's sentence. Ranges come straight from
+    // Kuromoji ([JapaneseTokenizer.extract]); [lookupKey]/[reading]/[surface]
+    // need no dictionary, so they're computed up front. The gloss + full JMdict
+    // detail are fetched lazily when the word is tapped.
+    private class SentenceWord(
+        val start: Int,
+        val end: Int,
+        val surface: String,
+        val lookupKey: String,
+        val reading: String,
+    )
+
+    // Interactive-sentence colors.
+    private val cWordUnderline = Color.argb(150, 150, 195, 240)     // idle morpheme underline
+    private val cWordUnderlineSel = Color.argb(255, 120, 205, 255)  // selected morpheme underline
+    private val cWordTextSel = Color.rgb(150, 212, 255)             // selected morpheme text
+    private val cWordChip = Color.argb(48, 120, 185, 255)           // selected morpheme chip bg
+
+    /**
+     * A TextView that draws a short underline under each Kuromoji morpheme with a
+     * gap between adjacent ones, so the splits read as separate, tappable chunks (a
+     * single continuous underline would hide the divisions). The selected morpheme
+     * gets a rounded highlight chip + a brighter underline (its text is recolored
+     * by a span the caller manages). Multi-line safe — a morpheme that wraps draws
+     * one segment per line. Hit-testing is done by the ClickableSpans +
+     * LinkMovementMethod installed in [setupInteractiveSentence]; this only paints.
+     */
+    private inner class SentenceTextView(context: Context) : TextView(context) {
+        var segments: List<SentenceWord> = emptyList()
+        var selected: SentenceWord? = null
+
+        private val d = resources.displayMetrics.density
+        private val gap = d * 3.5f            // half-gap trimmed off each underline end
+        private val underlineDrop = d * 3f    // below the baseline
+        private val chipRadius = d * 5f
+        private val chipPadX = d * 2.5f
+        private val chipPadY = d * 2f
+        private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val chipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+
+        override fun onDraw(canvas: Canvas) {
+            val lay = layout
+            if (lay == null) { super.onDraw(canvas); return }
+            val cLeft = totalPaddingLeft.toFloat()
+            val cTop = totalPaddingTop.toFloat()
+            val fm = paint.fontMetrics
+
+            // Selected chip snug around the glyphs (drawn before the text). Bounds
+            // come from the font metrics around each line's baseline, so extra line
+            // spacing doesn't stretch the chip.
+            selected?.let { seg ->
+                chipPaint.color = cWordChip
+                forEachLineSpan(lay, seg.start, seg.end) { line, xa, xb ->
+                    val baseline = lay.getLineBaseline(line) + cTop
+                    val top = baseline + fm.ascent - chipPadY
+                    val bottom = baseline + underlineDrop + chipPadY
+                    canvas.drawRoundRect(
+                        RectF(cLeft + xa - chipPadX, top, cLeft + xb + chipPadX, bottom),
+                        chipRadius, chipRadius, chipPaint
+                    )
+                }
+            }
+
+            super.onDraw(canvas)
+
+            // One gapped underline per morpheme (per wrapped line).
+            for (seg in segments) {
+                val sel = seg === selected
+                linePaint.color = if (sel) cWordUnderlineSel else cWordUnderline
+                linePaint.strokeWidth = if (sel) d * 2f else d * 1.4f
+                forEachLineSpan(lay, seg.start, seg.end) { line, xa, xb ->
+                    val left = cLeft + xa + gap
+                    val right = cLeft + xb - gap
+                    if (right <= left) return@forEachLineSpan
+                    val y = lay.getLineBaseline(line) + cTop + underlineDrop
+                    canvas.drawLine(left, y, right, y, linePaint)
+                }
+            }
+        }
+
+        // Invokes [block] once per screen line the [start,end) range covers, with
+        // the range's left/right x on that line (in layout coords, padding added by
+        // the caller).
+        private inline fun forEachLineSpan(
+            lay: android.text.Layout, start: Int, end: Int,
+            block: (line: Int, xa: Float, xb: Float) -> Unit,
+        ) {
+            if (start >= end) return
+            val first = lay.getLineForOffset(start)
+            // Anchor the last line on the last *included* char (end is exclusive) so
+            // a range ending exactly at a wrap boundary doesn't spill onto the line
+            // it merely touches.
+            val last = lay.getLineForOffset(end - 1)
+            for (line in first..last) {
+                val lineStart = lay.getLineStart(line)
+                val lineEnd = lay.getLineEnd(line)
+                val ls = maxOf(start, lineStart)
+                val le = minOf(end, lineEnd)
+                if (ls >= le) continue
+                val xa = lay.getPrimaryHorizontal(ls)
+                // At a wrap boundary getPrimaryHorizontal(lineEnd) points at the
+                // START of the next line (x≈0), so for a range that runs to the end
+                // of this line use the line's text extent (getLineMax = trailing edge
+                // of the last glyph; getLineRight would be the full layout width).
+                val xb = if (le >= lineEnd) lay.getLineMax(line)
+                         else lay.getPrimaryHorizontal(le)
+                block(line, minOf(xa, xb), maxOf(xa, xb))
+            }
+        }
+    }
+
+    /**
+     * Turns the popup's sentence into a run of individually-underlined, tappable
+     * morphemes (drawn by [SentenceTextView]). Tapping one expands its dictionary
+     * entry (reading + JMdict/KANJIDIC2 detail) inline in
+     * [AnalysisPopup.wordDetailPanel] with a height animation and marks the word
+     * selected (chip + colored text + brighter underline); tapping the same word
+     * again collapses it, and tapping a different word swaps the content. The popup
+     * width is fixed, so the panel only ever grows/shrinks vertically.
+     */
+    private fun setupInteractiveSentence(
+        ui: AnalysisPopup,
+        sentence: String,
+        words: List<SentenceWord>,
+        translation: String,
+    ) {
+        val title = ui.titleView
+        val panel = ui.wordDetailPanel
+        val spannable = SpannableStringBuilder(sentence)
+        // Width the detail panel lays out at (fixed popup width minus the panel's
+        // own horizontal padding) — used to pre-measure the expand target height.
+        val panelContentW = (ui.textMaxW - dp(16)).coerceAtLeast(dp(80))
+
+        // Selection + async-load state, private to this popup instance.
+        var selectedStart = -1
+        var loadSeq = 0
+        var textSpan: ForegroundColorSpan? = null
+
+        // Marks [w] selected (or clears selection when null): recolors that word's
+        // text and tells the view which morpheme to chip/brighten.
+        fun setSelection(w: SentenceWord?) {
+            textSpan?.let { spannable.removeSpan(it) }
+            textSpan = null
+            if (w != null) {
+                val s = ForegroundColorSpan(cWordTextSel)
+                spannable.setSpan(s, w.start, w.end, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                textSpan = s
+            }
+            title.selected = w
+            title.invalidate()
+        }
+
+        fun collapse() {
+            selectedStart = -1
+            loadSeq++
+            setSelection(null)
+            if (panel.visibility == View.VISIBLE) animateCollapse(panel) { panel.removeAllViews() }
+        }
+
+        fun select(w: SentenceWord) {
+            selectedStart = w.start
+            setSelection(w)
+            val mySeq = ++loadSeq
+            val fetchAndExpand = {
+                Thread {
+                    val info = runCatching { JmDict.lookupWord(w.lookupKey) }.getOrNull()
+                    val entry = WordEntry(
+                        w.lookupKey, w.reading,
+                        info?.gloss ?: "(not in dictionary)",
+                        info?.jlpt ?: "", surface = w.surface
+                    )
+                    val details = runCatching { JmDict.lookupWordDetail(w.lookupKey) }
+                        .getOrDefault(emptyList())
+                    val kanji = kanjiInfoForWord(w.lookupKey)
+                    mainHandler.post {
+                        // Superseded by a newer tap / collapse while loading.
+                        if (mySeq != loadSeq) return@post
+                        panel.removeAllViews()
+                        panel.addView(buildWordRow(entry, sentence, translation))
+                        if (details.isNotEmpty() || kanji.isNotEmpty())
+                            panel.addView(renderWordDetail(details, kanji, panelContentW))
+                        // Measure at the panel's true outer width (its inner padding
+                        // is already accounted for in panelContentW).
+                        animateExpand(panel, ui.textMaxW)
+                    }
+                }.start()
+            }
+            // Switching words: collapse the open panel first, then load + expand.
+            if (panel.visibility == View.VISIBLE) {
+                animateCollapse(panel) { panel.removeAllViews(); fetchAndExpand() }
+            } else fetchAndExpand()
+        }
+
+        // ClickableSpan = the tap target only; it draws nothing (SentenceTextView
+        // owns all the underline/selection painting), so updateDrawState is a no-op.
+        for (w in words) {
+            spannable.setSpan(object : ClickableSpan() {
+                override fun onClick(v: View) {
+                    if (selectedStart == w.start && panel.visibility == View.VISIBLE) collapse()
+                    else select(w)
+                }
+                override fun updateDrawState(ds: android.text.TextPaint) { /* no-op */ }
+            }, w.start, w.end, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+
+        title.segments = words
+        title.setText(spannable, TextView.BufferType.SPANNABLE)
+        title.movementMethod = LinkMovementMethod.getInstance()
+        title.highlightColor = Color.TRANSPARENT
+    }
+
+    /**
+     * Expands [view] from 0 to its natural height (measured at [widthPx]) with a
+     * fade-in, restoring WRAP_CONTENT at the end so later content changes still fit.
+     */
+    private fun animateExpand(view: View, widthPx: Int) {
+        view.measure(
+            View.MeasureSpec.makeMeasureSpec(widthPx, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        val target = view.measuredHeight
+        val lp = view.layoutParams
+        lp.height = 0
+        view.layoutParams = lp
+        view.visibility = View.VISIBLE
+        view.alpha = 0f
+        ValueAnimator.ofInt(0, target).apply {
+            duration = 200
+            addUpdateListener {
+                lp.height = it.animatedValue as Int
+                view.layoutParams = lp
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    lp.height = LinearLayout.LayoutParams.WRAP_CONTENT
+                    view.layoutParams = lp
+                }
+            })
+            start()
+        }
+        view.animate().alpha(1f).setDuration(200).start()
+    }
+
+    /** Collapses [view] to 0 height with a fade-out, sets it GONE, then runs [onEnd]. */
+    private fun animateCollapse(view: View, onEnd: (() -> Unit)? = null) {
+        val from = if (view.height > 0) view.height else 0
+        val lp = view.layoutParams
+        ValueAnimator.ofInt(from, 0).apply {
+            duration = 160
+            addUpdateListener {
+                lp.height = it.animatedValue as Int
+                view.layoutParams = lp
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    view.visibility = View.GONE
+                    lp.height = LinearLayout.LayoutParams.WRAP_CONTENT
+                    view.alpha = 1f
+                    view.layoutParams = lp
+                    onEnd?.invoke()
+                }
+            })
+            start()
+        }
+        view.animate().alpha(0f).setDuration(160).start()
+    }
 
     /** Shared AnkiDroid guards. Returns false (after toasting / prompting) if not ready. */
     private fun ankiPreflight(): Boolean {
@@ -2193,19 +2394,21 @@ class OverlayService : Service() {
     }
 
     /**
-     * The analysis popup scaffold. The caller fills the section views
-     * (Word-by-word list, Reading, Translation) and then calls [show] — the
-     * window is only added once fully populated, so it appears in its final
-     * position at its final size (no loading placeholder → no flicker or jump).
+     * The analysis popup scaffold. The caller makes the sentence interactive
+     * ([setupInteractiveSentence] fills [titleView] + drives [wordDetailPanel])
+     * and fills the whole-sentence sections (Reading, Translation), then calls
+     * [show] — the window is only added once fully populated, so it appears in
+     * its final position at its final size (no loading placeholder → no flicker).
      */
     private class AnalysisPopup(
         val holder: PopupHolder,
         val container: View,
-        val wordHeader: TextView,
-        val wordBody: TextView,
-        val wordList: LinearLayout,
+        val titleView: SentenceTextView,
+        val wordDetailPanel: LinearLayout,
         val readingHeader: TextView,
         val readingBody: TextView,
+        val romajiHeader: TextView,
+        val romajiBody: TextView,
         val transHeader: TextView,
         val transBody: TextView,
         val textMaxW: Int,
@@ -2222,25 +2425,30 @@ class OverlayService : Service() {
      *   no post-load reposition, no flicker. While it's up the transparent
      *   sentence boxes are hidden ([setSentenceBoxesVisible]); they return when
      *   it closes.
-     * - The window width is **fixed** (`min(screen − 16dp, 400dp)`) — content
-     *   can never change the popup's width, so text wraps predictably and
-     *   expand panels can't push it off-screen sideways.
+     * - The window width is **fixed** (`min(screen − 16dp, 400dp)`, floored so it
+     *   stays comfortably wide for short sentences) — content can never change the
+     *   popup's width, so text wraps predictably and the tapped-word detail panel
+     *   only ever grows/shrinks vertically, never sideways.
      * - Height wraps content but is hard-capped (~65% of screen) by the section
-     *   ScrollView, whose cap is computed from what the top bar + title actually
-     *   used. A layout listener re-clamps the window position whenever the
-     *   height changes (chevron expand/collapse), so the popup can never end up
-     *   past the bottom edge — even after the user dragged it.
-     * - Top bar = centered grip + ✕ at the right; the title sits on its own line
-     *   below (weighted width so it wraps fully, max 4 lines ellipsized — the
-     *   copy icon copies the complete text) — nothing overlaps or clips.
-     * - Dragging is via the top bar or title row ONLY — a container-wide drag
-     *   listener was tried and reverted (it fought the scroll/click gestures).
+     *   ScrollView, whose cap is computed from what the top bar actually used. A
+     *   layout listener re-clamps the window position whenever the height changes
+     *   (word-detail expand/collapse), so the popup can never end up past the
+     *   bottom edge — even after the user dragged it.
+     * - Top bar = centered grip + ✕ at the right. The interactive sentence, the
+     *   tapped-word detail panel, and the section bodies all live inside the
+     *   scroll area, so a long sentence scrolls instead of being clipped.
+     * - Dragging is via the top bar ONLY (the sentence is tappable now — a drag
+     *   listener on it would fight the word taps and the scroll gesture).
      */
     private fun buildAnalysisPopup(anchor: android.graphics.Rect, title: String): AnalysisPopup {
         val screenW = resources.displayMetrics.widthPixels
         val screenH = resources.displayMetrics.heightPixels
         val sideMargin = dp(8)
-        val popupW = min(screenW - sideMargin * 2, dp(400))
+        // Fixed, content-independent width so the popup never changes size sideways
+        // (and stays comfortably wide even for a one-word sentence): the usual
+        // 400dp, but never below 320dp unless the screen itself is narrower.
+        val maxW = screenW - sideMargin * 2
+        val popupW = min(maxW, dp(400)).coerceAtLeast(min(maxW, dp(320)))
         val maxPopupH = (screenH * 0.65f).toInt()
         // Width available to content inside the container padding — labels and
         // detail panels wrap before hitting the popup edge.
@@ -2276,13 +2484,17 @@ class OverlayService : Service() {
             })
         }
 
-        // ── Title row: the sentence (weighted → wraps fully, never clipped) + copy ──
-        val titleView = TextView(this).apply {
+        // ── Sentence row (scrolls with the rest): the sentence, with each Kuromoji
+        // morpheme underlined + tappable (spans installed by setupInteractiveSentence),
+        // plus a copy icon that copies the whole sentence. Larger text than the
+        // sections so the tap targets are comfortable. ──
+        val titleView = SentenceTextView(this).apply {
             text = title
             setTextColor(Color.WHITE)
-            textSize = 15f
-            maxLines = 4
-            ellipsize = android.text.TextUtils.TruncateAt.END
+            textSize = 16f
+            // Extra line spacing leaves room for the per-morpheme underlines below
+            // the baseline (drawn by SentenceTextView) and keeps taps comfortable.
+            setLineSpacing(dp(6).toFloat(), 1f)
         }
         val titleRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -2296,22 +2508,17 @@ class OverlayService : Service() {
             setPadding(0, dp(2), 0, dp(6))
         }
 
-        val wordHeader = TextView(this).apply {
-            text = "Word-by-word"
-            setTextColor(Color.argb(255, 180, 220, 255))
-            textSize = 12f
-            setPadding(0, dp(4), 0, dp(2))
-        }
-        val wordBody = TextView(this).apply {
-            setTextColor(Color.argb(255, 230, 230, 230))
-            textSize = 13f
-            maxWidth = textMaxW
-        }
-        // Structured per-word rows replace `wordBody` once the dictionary lookup
-        // completes. Each row carries a "+ Anki" button that adds the word as a card.
-        val wordList = LinearLayout(this).apply {
+        // The tapped word's dictionary entry expands here (below the sentence,
+        // above the whole-sentence sections). A subtle rounded card, animated
+        // open/closed by setupInteractiveSentence.
+        val wordDetailPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
+            background = GradientDrawable().apply {
+                setColor(Color.argb(38, 255, 255, 255))
+                cornerRadius = dp(8).toFloat()
+            }
+            setPadding(dp(8), dp(6), dp(8), dp(8))
         }
         val readingHeader = TextView(this).apply {
             text = "Reading"
@@ -2321,6 +2528,19 @@ class OverlayService : Service() {
             visibility = View.GONE
         }
         val readingBody = TextView(this).apply {
+            setTextColor(Color.argb(255, 230, 230, 230))
+            textSize = 14f
+            maxWidth = textMaxW
+            visibility = View.GONE
+        }
+        val romajiHeader = TextView(this).apply {
+            text = "Romaji"
+            setTextColor(Color.argb(255, 180, 220, 255))
+            textSize = 12f
+            setPadding(0, dp(6), 0, dp(2))
+            visibility = View.GONE
+        }
+        val romajiBody = TextView(this).apply {
             setTextColor(Color.argb(255, 230, 230, 230))
             textSize = 14f
             maxWidth = textMaxW
@@ -2341,22 +2561,26 @@ class OverlayService : Service() {
         }
         val sectionsCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(wordHeader)
-            addView(wordBody)
-            addView(wordList)
+            addView(titleRow)
+            addView(wordDetailPanel, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(2); bottomMargin = dp(4) })
             addView(readingHeader)
             addView(readingBody)
+            addView(romajiHeader)
+            addView(romajiBody)
             addView(transHeader)
             addView(transBody)
         }
-        // ScrollView that caps its own height so top bar + title + sections never
-        // exceed maxPopupH. Below the cap it wraps to content (the popup stays
-        // small for short answers); past the cap it scrolls. The vertical
-        // LinearLayout parent measures children top-to-bottom, so the bars above
-        // are already measured when this runs.
+        // ScrollView that caps its own height so the top bar + sentence + sections
+        // never exceed maxPopupH. Below the cap it wraps to content (the popup stays
+        // small for short answers); past the cap it scrolls — so a long sentence
+        // scrolls rather than being clipped. The vertical LinearLayout parent
+        // measures children top-to-bottom, so the top bar is already measured here.
         val scroll = object : android.widget.ScrollView(this) {
             override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-                val used = topBar.measuredHeight + titleRow.measuredHeight + dp(24)
+                val used = topBar.measuredHeight + dp(20)
                 val cap = (maxPopupH - used).coerceAtLeast(dp(80))
                 super.onMeasure(
                     widthMeasureSpec,
@@ -2379,10 +2603,6 @@ class OverlayService : Service() {
             }
             setPadding(dp(12), dp(4), dp(12), dp(10))
             addView(topBar, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-            addView(titleRow, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ))
@@ -2439,7 +2659,7 @@ class OverlayService : Service() {
             }
         }
 
-        val holder = PopupHolder(container, wordBody)
+        val holder = PopupHolder(container)
 
         // Adds the window — call only after the sections are populated, so the
         // popup appears once, at its final size and position. The sentence boxes
@@ -2457,8 +2677,8 @@ class OverlayService : Service() {
                 return
             }
             setSentenceBoxesVisible(false)
-            // Whatever grows the popup later (chevron expand panels), never let
-            // it hang past the screen edge — this runs regardless of whether the
+            // Whatever grows the popup later (the tapped-word detail panel), never
+            // let it hang past the screen edge — this runs regardless of whether the
             // user has dragged the popup.
             container.addOnLayoutChangeListener { _, _, top, _, bottom, _, oldTop, _, oldBottom ->
                 if (bottom - top != oldBottom - oldTop) mainHandler.post { clampToScreen() }
@@ -2470,8 +2690,8 @@ class OverlayService : Service() {
             updateOcrButtonAppearance()
         }
 
-        // Drag-to-move via the top bar or the title row (the ✕ / copy icons are
-        // clickable and consume their own touches first). Once dragged,
+        // Drag-to-move via the top bar only (the sentence row now holds tappable
+        // words + scrolls, so it can't double as a drag handle). Once dragged,
         // userMovedPopup is set — clampToScreen still keeps the popup on-screen
         // when it later grows.
         var dragInitialX = 0
@@ -2503,16 +2723,16 @@ class OverlayService : Service() {
             }
         }
         topBar.setOnTouchListener(dragListener)
-        titleRow.setOnTouchListener(dragListener)
 
         return AnalysisPopup(
             holder = holder,
             container = container,
-            wordHeader = wordHeader,
-            wordBody = wordBody,
-            wordList = wordList,
+            titleView = titleView,
+            wordDetailPanel = wordDetailPanel,
             readingHeader = readingHeader,
             readingBody = readingBody,
+            romajiHeader = romajiHeader,
+            romajiBody = romajiBody,
             transHeader = transHeader,
             transBody = transBody,
             textMaxW = textMaxW,
@@ -2521,85 +2741,73 @@ class OverlayService : Service() {
     }
 
     /**
-     * The analysis popup (both modes: sentence-box tap and crop). Which sections
-     * appear is controlled by the home-screen toggles: Dictionary = word-by-word
-     * rows (morphemes glossed against JMdict, each expandable to the full JMdict
-     * + KANJIDIC2 detail), Reading = the full kana reading, Translation = the
-     * offline FuguMT translation. Everything runs on-device — nothing leaves the
-     * device. [anchor] is the screen rect the popup positions itself around (the
-     * tapped sentence box, or the crop selection).
+     * The analysis popup (both modes: sentence-box tap and crop). The sentence
+     * itself is the dictionary: every Kuromoji morpheme is underlined and tappable,
+     * and tapping one expands its JMdict/KANJIDIC2 entry inline
+     * ([setupInteractiveSentence]). Three home-screen toggles add whole-sentence
+     * sections below it: Reading = the full kana reading, Romaji = its Hepburn
+     * transliteration, Translation = the offline FuguMT translation. Everything runs
+     * on-device — nothing leaves the device.
+     * [anchor] is the screen rect the popup positions itself around (the tapped
+     * sentence box, or the crop selection).
      *
-     * All lookups run BEFORE the popup is built and shown — there is no loading
-     * placeholder, so the popup appears exactly once, fully populated, at its
-     * final size and position (no flicker/jump when data arrives). A newer tap
+     * The whole-sentence lookups (reading/translation) run BEFORE the popup is
+     * built and shown — there is no loading placeholder, so the popup appears
+     * exactly once, fully populated, at its final size and position (no
+     * flicker/jump). Per-word dictionary lookups happen lazily on tap. A newer tap
      * or a dismissed overlay supersedes an in-flight lookup via [popupRequestSeq].
      */
     private fun showDictAnalysisPopup(sentence: String, anchor: android.graphics.Rect) {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val showDictionary = prefs.getBoolean(PREF_SHOW_DICTIONARY, true)
         val showReading = prefs.getBoolean(PREF_SHOW_READING, true)
+        val showRomaji = prefs.getBoolean(PREF_SHOW_ROMAJI, true)
         val showTranslation = prefs.getBoolean(PREF_SHOW_TRANSLATION, true)
-
-        if (!showDictionary && !showReading && !showTranslation) {
-            // Nothing to fetch — show the hint immediately.
-            val ui = buildAnalysisPopup(anchor, sentence)
-            ui.wordHeader.visibility = View.GONE
-            ui.wordBody.text =
-                "All sections are off — enable Reading, Translation or Dictionary on the JP Lens home screen."
-            ui.show()
-            return
-        }
 
         val requestId = ++popupRequestSeq
         Thread {
             // No-op if handleStart already warmed it; guards against a tap that
             // races the warm-up.
             JmDict.warmUp(this)
-            val available = JmDict.isAvailable()
+            val dictAvailable = JmDict.isAvailable()
 
-            // Word-by-word: one row per morpheme, in the exact order they appear in
-            // the sentence (no dedup — the list mirrors the sentence). Each row's
-            // *label* is the morpheme's surface (the text actually shown), not
-            // Sudachi's normalized form, which can canonicalize a kana word into a
-            // rarely-used kanji. The gloss/detail/Anki still key off a dictionary
-            // lookup form (see lookupKey below).
-            val entries = ArrayList<WordEntry>()
-            if (showDictionary && available) {
-                val morphemes = runCatching { JapaneseTokenizer.extract(sentence) }
-                    .getOrDefault(emptyList())
-                for (m in morphemes) {
-                    val surface = m.surface
-                    // Lookup key: an all-kana surface means the writer chose kana on
-                    // purpose, so look the word up by its kana form — that lets
-                    // JMdict's kana_pref ranking surface the kana-native entry (and its
-                    // reading-only / rarely-used-kanji writings) instead of a kanji
-                    // homograph. Words written with kanji look up by the dictionary form.
-                    val lookupKey = if (!JapaneseTokenizer.containsKanji(surface)) {
-                        when {
-                            m.base.isNotEmpty() && !JapaneseTokenizer.containsKanji(m.base) -> m.base
-                            m.reading.isNotEmpty() -> JapaneseTokenizer.katakanaToHiragana(m.reading)
-                            else -> surface
-                        }
-                    } else m.base
-                    // Furigana column: only when the displayed surface carries kanji.
-                    val reading = if (JapaneseTokenizer.containsKanji(surface) && m.reading.isNotEmpty())
-                        JapaneseTokenizer.katakanaToHiragana(m.reading) else ""
-                    val info = JmDict.lookupWord(lookupKey)
-                    val gloss = info?.gloss ?: "(not in dictionary)"
-                    entries += WordEntry(
-                        lookupKey, reading, gloss, info?.jlpt ?: "", surface = surface
-                    )
-                }
-            }
+            // The interactive-sentence words: one tappable span per morpheme, in the
+            // order they appear. Only the range + lookup form/reading/surface are
+            // computed here (no dictionary hit — the gloss + full detail load lazily
+            // when a word is tapped). The *surface* is what's shown in the sentence;
+            // the lookup form keys the dictionary.
+            val words = if (dictAvailable) {
+                runCatching { JapaneseTokenizer.extract(sentence) }.getOrDefault(emptyList())
+                    .map { m ->
+                        val surface = m.surface
+                        // An all-kana surface means the writer chose kana on purpose,
+                        // so look the word up by its kana form — that lets JMdict's
+                        // kana_pref ranking surface the kana-native entry instead of a
+                        // kanji homograph. Words with kanji look up by dictionary form.
+                        val lookupKey = if (!JapaneseTokenizer.containsKanji(surface)) {
+                            when {
+                                m.base.isNotEmpty() && !JapaneseTokenizer.containsKanji(m.base) -> m.base
+                                m.reading.isNotEmpty() -> JapaneseTokenizer.katakanaToHiragana(m.reading)
+                                else -> surface
+                            }
+                        } else m.base
+                        // Furigana in the header row: only when the surface carries kanji.
+                        val reading = if (JapaneseTokenizer.containsKanji(surface) && m.reading.isNotEmpty())
+                            JapaneseTokenizer.katakanaToHiragana(m.reading) else ""
+                        SentenceWord(m.start, m.end, surface, lookupKey, reading)
+                    }
+            } else emptyList()
 
-            // Full kana reading of the whole sentence (mode-A re-tokenization, so
-            // particles/auxiliaries get readings too), built from Sudachi.
+            // Full kana reading of the whole sentence (re-tokenized so particles /
+            // auxiliaries get readings too).
             val reading = if (showReading)
                 runCatching { JapaneseTokenizer.fullReadingHiragana(sentence) }.getOrDefault("")
             else ""
 
-            // No standalone Kanji section — each word's own kanji are folded into
-            // that word's expandable detail panel (see buildWordRow).
+            // Hepburn romaji of the whole sentence (from token pronunciations).
+            val romaji = if (showRomaji)
+                runCatching { JapaneseTokenizer.fullRomaji(sentence) }.getOrDefault("")
+            else ""
+
             val translation = if (showTranslation)
                 runCatching { Translator.translateJaToEn(sentence) }.getOrDefault("")
             else ""
@@ -2610,27 +2818,18 @@ class OverlayService : Service() {
                 if (requestId != popupRequestSeq) return@post
 
                 val ui = buildAnalysisPopup(anchor, sentence)
-                if (!showDictionary) {
-                    ui.wordHeader.visibility = View.GONE
-                    ui.wordBody.visibility = View.GONE
-                } else if (!available) {
-                    ui.wordBody.text =
-                        "Dictionary not built — run scripts/build_jmdict_db.py and reinstall."
-                } else if (entries.isNotEmpty()) {
-                    ui.wordBody.visibility = View.GONE
-                    for (w in entries) {
-                        ui.wordList.addView(
-                            buildWordRow(w, ui.textMaxW, sentence, translation, expandable = true)
-                        )
-                    }
-                    ui.wordList.visibility = View.VISIBLE
-                } else {
-                    ui.wordBody.text = "(no words found)"
+                if (words.isNotEmpty()) {
+                    setupInteractiveSentence(ui, sentence, words, translation)
                 }
                 if (reading.isNotBlank() && reading != sentence) {
                     ui.readingBody.text = reading
                     ui.readingHeader.visibility = View.VISIBLE
                     ui.readingBody.visibility = View.VISIBLE
+                }
+                if (romaji.isNotBlank()) {
+                    ui.romajiBody.text = romaji
+                    ui.romajiHeader.visibility = View.VISIBLE
+                    ui.romajiBody.visibility = View.VISIBLE
                 }
                 if (showTranslation) {
                     // The toggle is on, so surface a failure instead of silently
