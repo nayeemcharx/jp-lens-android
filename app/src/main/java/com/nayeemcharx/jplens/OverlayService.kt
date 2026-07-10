@@ -14,10 +14,13 @@ import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorFilter
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.text.Spannable
 import android.text.SpannableStringBuilder
@@ -207,10 +210,11 @@ class OverlayService : Service() {
         // hidden and isProcessing stuck — drop the stale selector first.
         cancelCropSelector()
 
-        // A fresh capture session always starts in full-screen (🔍) mode, regardless
-        // of the last-used mode; the radial menu switches live after.
-        mode = MODE_SENTENCE_DICT
-        persistMode()
+        // Resume whatever mode the user last used (persisted in PREF_LAST_MODE);
+        // the radial menu still switches live after. Full-screen is only the
+        // fallback for a first-ever run.
+        mode = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getInt(PREF_LAST_MODE, MODE_SENTENCE_DICT)
         Log.i(TAG, "Starting mode=$mode (2=full screen, 4=crop)")
 
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
@@ -346,16 +350,85 @@ class OverlayService : Service() {
         (Color.blue(color) * (1 - t)).toInt(),
     )
 
+    /**
+     * The "full screen" glyph: four bent corner brackets (an L at each corner) with
+     * a rounded bend — a viewfinder/expand look, replacing the old 🔍 emoji. Strokes
+     * within its bounds; used on the floating button and in the radial menu.
+     */
+    private class CornerBracketDrawable(
+        color: Int,
+        private val strokeW: Float,
+        private val sizePx: Int,
+    ) : Drawable() {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = strokeW
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+            this.color = color
+        }
+        private val path = Path()
+
+        override fun draw(canvas: Canvas) {
+            val b = bounds
+            val inset = strokeW
+            val left = b.left + inset
+            val top = b.top + inset
+            val right = b.right - inset
+            val bottom = b.bottom - inset
+            val side = (right - left)
+            val arm = side * 0.34f   // length of each corner leg
+            val r = side * 0.20f     // radius of the corner bend
+            path.reset()
+            // top-left
+            path.moveTo(left, top + arm)
+            path.lineTo(left, top + r)
+            path.quadTo(left, top, left + r, top)
+            path.lineTo(left + arm, top)
+            // top-right
+            path.moveTo(right - arm, top)
+            path.lineTo(right - r, top)
+            path.quadTo(right, top, right, top + r)
+            path.lineTo(right, top + arm)
+            // bottom-right
+            path.moveTo(right, bottom - arm)
+            path.lineTo(right, bottom - r)
+            path.quadTo(right, bottom, right - r, bottom)
+            path.lineTo(right - arm, bottom)
+            // bottom-left
+            path.moveTo(left + arm, bottom)
+            path.lineTo(left + r, bottom)
+            path.quadTo(left, bottom, left, bottom - r)
+            path.lineTo(left, bottom - arm)
+            canvas.drawPath(path, paint)
+        }
+
+        override fun getIntrinsicWidth() = sizePx
+        override fun getIntrinsicHeight() = sizePx
+        override fun setAlpha(alpha: Int) { paint.alpha = alpha }
+        override fun setColorFilter(cf: ColorFilter?) { paint.colorFilter = cf }
+        @Deprecated("deprecated in Drawable", ReplaceWith("PixelFormat.TRANSLUCENT"))
+        override fun getOpacity() = PixelFormat.TRANSLUCENT
+    }
+
     private fun updateOcrButtonAppearance() {
         val btn = floatingView as? Button ?: return
         // "Active" (tap clears) when boxes are showing, or when a crop-mode popup
         // is open without boxes.
         val active = sentenceBoxOverlay != null || popup != null
+        // Full-screen mode uses a drawn bracket icon (no glyph); the other states
+        // keep their text glyphs.
+        val fullScreen = !active && mode != MODE_CROP
         btn.text = when {
             active -> "✕"
             mode == MODE_CROP -> "✂"
-            else -> "🔍"
+            else -> ""
         }
+        btn.foreground = if (fullScreen) {
+            CornerBracketDrawable(Color.WHITE, dp(2).toFloat() + 0.4f, dp(22)).also {
+                btn.foregroundGravity = Gravity.CENTER
+            }
+        } else null
         btn.textSize = if (active) 18f else 20f
         val base = when {
             active -> Color.argb(235, 220, 80, 60)
@@ -504,6 +577,7 @@ class OverlayService : Service() {
         val label: String,
         val color: Int,
         val desc: String,
+        val useIcon: Boolean = false,
         val action: () -> Unit,
     )
 
@@ -555,8 +629,9 @@ class OverlayService : Service() {
         val screenH = metrics.heightPixels
 
         val options = buildList {
-            add(MenuOption("🔍", Color.argb(235, 40, 160, 120),
-                "Full Screen Mode\nTap the floating button to detect Japanese text anywhere on screen, then tap a detected text box to view a full analysis.") { setMode(MODE_SENTENCE_DICT) })
+            add(MenuOption("", Color.argb(235, 40, 160, 120),
+                "Full Screen Mode\nTap the floating button to detect Japanese text anywhere on screen, then tap a detected text box to view a full analysis.",
+                useIcon = true) { setMode(MODE_SENTENCE_DICT) })
             add(MenuOption("✂", Color.argb(235, 230, 140, 40),
                 "Crop Mode\nTap the floating button, then drag a box around the area you want to scan. Only the selected area will be processed.") { setMode(MODE_CROP) })
             add(MenuOption("Stop", Color.argb(235, 220, 80, 60),
@@ -585,12 +660,16 @@ class OverlayService : Service() {
             val view = TextView(this).apply {
                 text = opt.label
                 setTextColor(Color.WHITE)
-                // Glyph options (🔍 / ✂) read best big; the "Stop" word needs to
-                // fit inside the same circle.
+                // Glyph option (✂) reads best big; the "Stop" word needs to fit
+                // inside the same circle. The full-screen option draws a bracket icon.
                 textSize = if (opt.label.length <= 2) 19f else 13f
                 setTypeface(typeface, Typeface.BOLD)
                 gravity = Gravity.CENTER
                 background = optionDrawable(opt.color, selected = false)
+                if (opt.useIcon) {
+                    foreground = CornerBracketDrawable(Color.WHITE, dp(2).toFloat() + 0.2f, dp(20))
+                    foregroundGravity = Gravity.CENTER
+                }
                 elevation = dp(4).toFloat()
                 alpha = 0.9f
             }
