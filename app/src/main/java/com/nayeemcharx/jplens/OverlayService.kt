@@ -24,8 +24,6 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.text.Spannable
 import android.text.SpannableStringBuilder
-import android.text.method.LinkMovementMethod
-import android.text.style.ClickableSpan
 import android.text.style.ForegroundColorSpan
 import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
@@ -1640,14 +1638,21 @@ class OverlayService : Service() {
      * single continuous underline would hide the divisions). The selected morpheme
      * gets a rounded highlight chip + a brighter underline (its text is recolored
      * by a span the caller manages). Multi-line safe — a morpheme that wraps draws
-     * one segment per line. Hit-testing is done by the ClickableSpans +
-     * LinkMovementMethod installed in [setupInteractiveSentence]; this only paints.
+     * one segment per line. Hit-testing is done by this view's own geometry
+     * (onTouchEvent → wordAt), reusing the same per-line spans as the underlines.
      */
     private inner class SentenceTextView(context: Context) : TextView(context) {
         var segments: List<SentenceWord> = emptyList()
         var selected: SentenceWord? = null
+        // Tap callback — resolved by our own geometry hit-test (see onTouchEvent),
+        // not LinkMovementMethod, which misses the last char of a wrapped line.
+        var onWordTap: ((SentenceWord) -> Unit)? = null
 
         private val d = resources.displayMetrics.density
+        private val hitPad = d * 4f           // horizontal slack so small end glyphs are tappable
+        private val touchSlop = d * 8f
+        private var downX = 0f
+        private var downY = 0f
         private val gap = d * 3.5f            // half-gap trimmed off each underline end
         private val underlineDrop = d * 3f    // below the baseline
         private val chipRadius = d * 5f
@@ -1727,6 +1732,48 @@ class OverlayService : Service() {
                          else lay.getPrimaryHorizontal(le)
                 block(line, minOf(xa, xb), maxOf(xa, xb))
             }
+        }
+
+        // Own hit-testing (replaces LinkMovementMethod): resolve the tapped morpheme
+        // from the exact per-line spans the underlines are painted from, so the last
+        // glyph of a wrapped line is reachable. Consumes only genuine taps; drags
+        // fall through so the enclosing ScrollView can still scroll.
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.x
+                    downY = event.y
+                    return true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (abs(event.x - downX) <= touchSlop && abs(event.y - downY) <= touchSlop) {
+                        wordAt(event.x, event.y)?.let { onWordTap?.invoke(it); return true }
+                    }
+                }
+            }
+            return super.onTouchEvent(event)
+        }
+
+        /** The morpheme whose painted span (with a little slack) contains the point, nearest first. */
+        private fun wordAt(ex: Float, ey: Float): SentenceWord? {
+            val lay = layout ?: return null
+            val x = ex - totalPaddingLeft
+            val y = (ey - totalPaddingTop).toInt().coerceIn(0, height)
+            val line = lay.getLineForVertical(y)
+            var best: SentenceWord? = null
+            var bestDist = Float.MAX_VALUE
+            for (seg in segments) {
+                forEachLineSpan(lay, seg.start, seg.end) { l, xa, xb ->
+                    if (l != line || x < xa - hitPad || x > xb + hitPad) return@forEachLineSpan
+                    val dist = when {
+                        x < xa -> xa - x
+                        x > xb -> x - xb
+                        else -> 0f
+                    }
+                    if (dist < bestDist) { bestDist = dist; best = seg }
+                }
+            }
+            return best
         }
     }
 
@@ -1812,21 +1859,17 @@ class OverlayService : Service() {
             } else fetchAndExpand()
         }
 
-        // ClickableSpan = the tap target only; it draws nothing (SentenceTextView
-        // owns all the underline/selection painting), so updateDrawState is a no-op.
-        for (w in words) {
-            spannable.setSpan(object : ClickableSpan() {
-                override fun onClick(v: View) {
-                    if (selectedStart == w.start && panel.visibility == View.VISIBLE) collapse()
-                    else select(w)
-                }
-                override fun updateDrawState(ds: android.text.TextPaint) { /* no-op */ }
-            }, w.start, w.end, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        // Tap handling is done by SentenceTextView's own geometry hit-test (it owns
+        // all the underline/selection painting), so the last glyph of a wrapped line
+        // stays reachable — unlike LinkMovementMethod, which resolved a trailing tap
+        // to the next line's offset.
+        title.onWordTap = { w ->
+            if (selectedStart == w.start && panel.visibility == View.VISIBLE) collapse()
+            else select(w)
         }
 
         title.segments = words
         title.setText(spannable, TextView.BufferType.SPANNABLE)
-        title.movementMethod = LinkMovementMethod.getInstance()
         title.highlightColor = Color.TRANSPARENT
     }
 
@@ -2311,7 +2354,7 @@ class OverlayService : Service() {
     private inner class SentenceBoxOverlayView(context: Context) : View(context) {
         private var boxes: List<SentenceBox> = emptyList()
         private var rects: List<RectF> = emptyList()  // padded, in screen px
-        private val padY = dp(3).toFloat()
+        private val padY = 0f
         private val corner = dp(3).toFloat()
         private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.FILL
