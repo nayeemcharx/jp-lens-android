@@ -45,6 +45,11 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # Defensive: the repo tracks gradlew as executable (100755), but a checkout from a
+      # Windows filesystem can drop the bit — re-set it so CI never fails with "Permission denied".
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
       - name: Run unit tests
         run: ./gradlew :app:testDebugUnitTest --stacktrace
 

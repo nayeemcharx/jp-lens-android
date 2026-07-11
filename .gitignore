@@ -30,3 +30,6 @@ local.properties
 *.jks
 *.keystore
 /app/keystore.properties
+
+# Claude Code local settings / scratch — machine-specific, not shared.
+/.claude/
