@@ -1,0 +1,80 @@
+name: Unit tests
+
+# Runs the host-JVM unit tests (app/src/test) on every push and PR. These need no
+# device and no uncommitted assets — Kuromoji ships its dictionary in the JAR, so the
+# tokenizer/WordEntry tests run purely on the JVM.
+#
+# NOT run here: the instrumented tests (app/src/androidTest). They need an emulator and
+# the uncommitted jmdict.db / fugumt assets (they Assume-skip without them), so they're
+# left to local runs / manual QA. See the commented job at the bottom to enable them.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel superseded runs on the same ref (e.g. rapid pushes to a branch).
+  group: unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # AGP 9.x requires JDK 17 to run the build (the app itself still targets Java 11).
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Provides sdkmanager + accepts SDK licenses so AGP can auto-download the
+      # compileSdk platform (36.1) if the runner doesn't already have it.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      # Gradle wrapper validation + build caching.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run unit tests
+        run: ./gradlew :app:testDebugUnitTest --stacktrace
+
+      # Publish the HTML + XML report even when tests fail, so failures are inspectable.
+      - name: Upload test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: app/build/reports/tests/testDebugUnitTest
+          if-no-files-found: ignore
+
+# ---------------------------------------------------------------------------
+# Optional: instrumented tests on an emulator. Slow (~10-15 min) and most JmDict/
+# Translator assertions Assume-skip without the uncommitted assets, so it's disabled
+# by default. To enable, move this under `jobs:` and un-indent one level.
+#
+#  instrumented-tests:
+#    runs-on: ubuntu-latest
+#    timeout-minutes: 45
+#    steps:
+#      - uses: actions/checkout@v4
+#      - uses: actions/setup-java@v4
+#        with: { distribution: temurin, java-version: '17' }
+#      - uses: android-actions/setup-android@v3
+#      - uses: gradle/actions/setup-gradle@v4
+#      - name: Run instrumented tests
+#        uses: reactivecircus/android-emulator-runner@v2
+#        with:
+#          api-level: 30
+#          arch: x86_64
+#          script: ./gradlew :app:connectedDebugAndroidTest --stacktrace
+# ---------------------------------------------------------------------------
