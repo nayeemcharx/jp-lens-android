@@ -350,8 +350,10 @@ class FloatingButtonController(
     fun setLoading(loading: Boolean) {
         val btn = buttonView ?: return
         btn.setLoadingState(loading)
+        // updateAppearance owns the accessibility label because it knows all three
+        // relevant states (loading, active/clear, and idle capture). Do not overwrite
+        // its active "Clear Japanese text overlay" label after the spinner stops.
         updateAppearance(appearanceActive, appearanceMode)
-        btn.contentDescription = if (loading) "Processing Japanese text" else "Capture Japanese text"
     }
 
     /**
@@ -426,6 +428,11 @@ class FloatingButtonController(
         val btn = buttonView ?: return
         appearanceActive = active
         appearanceMode = mode
+        btn.contentDescription = when {
+            btn.loading -> "Processing Japanese text"
+            active -> "Clear Japanese text overlay"
+            else -> "Capture Japanese text"
+        }
         // Full-screen mode uses a drawn bracket icon (no glyph); the other states
         // keep their text glyphs.
         val fullScreen = !btn.loading && !active && mode != OverlayService.MODE_CROP

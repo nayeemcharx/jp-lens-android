@@ -253,7 +253,10 @@ class SentenceBoxOverlayController(
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
         windowManager.defaultDisplay.getRealMetrics(metrics)
-        val view = BoxOverlayView(context).apply { setBoxes(boxes) }
+        val view = BoxOverlayView(context).apply {
+            setBoxes(boxes)
+            contentDescription = "Japanese text detected: ${boxes.size} boxes"
+        }
         val params = WindowManager.LayoutParams(
             metrics.widthPixels, metrics.heightPixels,
             type,

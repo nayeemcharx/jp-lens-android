@@ -615,6 +615,7 @@ class AnalysisPopupController(
                         panel.addView(buildWordRow(entry, sentence, translation))
                         if (details.isNotEmpty() || kanji.isNotEmpty())
                             panel.addView(renderWordDetail(details, kanji, panelContentW))
+                        panel.contentDescription = "Dictionary word details for ${w.surface}"
                         // Measure at the panel's true outer width (its inner padding
                         // is already accounted for in panelContentW).
                         animateExpand(panel, ui.textMaxW)
