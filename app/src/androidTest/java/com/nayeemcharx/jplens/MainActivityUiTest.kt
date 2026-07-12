@@ -1,8 +1,15 @@
 package com.nayeemcharx.jplens
 
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsOff
+import androidx.compose.ui.test.assertIsOn
+import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.isToggleable
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import android.content.Context
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Rule
 import org.junit.Test
@@ -38,5 +45,40 @@ class MainActivityUiTest {
         composeRule.onNodeWithText("Permissions").assertExists()
         composeRule.onNodeWithText("Breakdown").assertExists()
         composeRule.onNodeWithText("About & privacy").assertExists()
+        composeRule.onNodeWithText("Reading (kana)").assertExists()
+        composeRule.onNodeWithText("Romaji").assertExists()
+        composeRule.onNodeWithText("Translation").assertExists()
+        composeRule.onAllNodes(isToggleable()).assertCountEquals(3)
+    }
+
+    @Test
+    fun breakdownSwitchPersistsReadingPreference() {
+        val prefs = composeRule.activity.getSharedPreferences(
+            OverlayService.PREFS_NAME, Context.MODE_PRIVATE)
+        val before = prefs.getBoolean(OverlayService.PREF_SHOW_READING, true)
+        val readingSwitch = composeRule.onAllNodes(isToggleable())[0]
+
+        if (before) readingSwitch.assertIsOn() else readingSwitch.assertIsOff()
+        readingSwitch.performClick()
+        composeRule.waitForIdle()
+        org.junit.Assert.assertEquals(
+            !before,
+            prefs.getBoolean(OverlayService.PREF_SHOW_READING, before),
+        )
+
+        // Restore device state so this test does not influence later launches.
+        readingSwitch.performClick()
+        composeRule.waitForIdle()
+    }
+
+    @Test
+    fun aboutScreenOpensAndReturnsWithoutRecreatingActivity() {
+        composeRule.onNodeWithText("About & privacy")
+            .performScrollTo()
+            .performClick()
+        composeRule.onNodeWithText("Nothing is sent off your device").assertExists()
+
+        composeRule.onNodeWithText("← Back").performClick()
+        composeRule.onNodeWithText("Breakdown").assertExists()
     }
 }

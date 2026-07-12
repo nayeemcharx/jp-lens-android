@@ -28,9 +28,13 @@ class TranslatorInstrumentedTest {
     }
 
     @Test
-    fun unavailableUntilWarmedUp() {
-        // Before warmUp the sessions aren't built, so isAvailable() must be false.
-        assertFalse("sessions should not be built before warmUp", Translator.isAvailable())
+    fun remainsUnavailableWhenAssetsAreMissing() {
+        // Unlike an "initially unavailable" assertion, this is independent of
+        // instrumentation test order and prior singleton warm-up in this process.
+        assumeTrue("model exists; missing-asset path does not apply",
+            !Translator.assetPresent(context))
+        Translator.warmUp(context)
+        assertFalse(Translator.isAvailable())
     }
 
     @Test

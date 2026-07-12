@@ -37,6 +37,7 @@ import com.nayeemcharx.jplens.MainActivity
 import com.nayeemcharx.jplens.OverlayService
 import com.nayeemcharx.jplens.Translator
 import com.nayeemcharx.jplens.WordEntry
+import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.min
 
@@ -74,7 +75,12 @@ class AnalysisPopupController(
     // Popup requests load their data BEFORE the popup is shown; this token (main
     // thread only) lets a newer tap — or a dismissed/cleared overlay — supersede
     // an older lookup that's still in flight, so a stale popup can't appear.
-    private var popupRequestSeq = 0
+    @Volatile private var popupRequestSeq = 0
+    // Bound all popup work to one worker. Rapid taps/resets can supersede work,
+    // but must not create an unbounded collection of expensive ONNX threads.
+    private val worker = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "JpLensAnalysis").apply { isDaemon = true }
+    }
 
     val isShowing: Boolean get() = popupView != null
 
@@ -91,6 +97,11 @@ class AnalysisPopupController(
         popupRequestSeq++
         // Bring the transparent sentence boxes back (hidden while the popup was up).
         listener.onPopupDismissed()
+    }
+
+    fun destroy() {
+        dismiss()
+        worker.shutdownNow()
     }
 
     /**
@@ -419,6 +430,7 @@ class AnalysisPopupController(
             strokeCap = Paint.Cap.ROUND
         }
         private val chipPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val chipBounds = RectF()
 
         override fun onDraw(canvas: Canvas) {
             val lay = layout
@@ -436,10 +448,8 @@ class AnalysisPopupController(
                     val baseline = lay.getLineBaseline(line) + cTop
                     val top = baseline + fm.ascent - chipPadY
                     val bottom = baseline + underlineDrop + chipPadY
-                    canvas.drawRoundRect(
-                        RectF(cLeft + xa - chipPadX, top, cLeft + xb + chipPadX, bottom),
-                        chipRadius, chipRadius, chipPaint
-                    )
+                    chipBounds.set(cLeft + xa - chipPadX, top, cLeft + xb + chipPadX, bottom)
+                    canvas.drawRoundRect(chipBounds, chipRadius, chipRadius, chipPaint)
                 }
             }
 
@@ -586,7 +596,7 @@ class AnalysisPopupController(
             setSelection(w)
             val mySeq = ++loadSeq
             val fetchAndExpand = {
-                Thread {
+                worker.execute {
                     val info = runCatching { JmDict.lookupWord(w.lookupKey) }.getOrNull()
                     val entry = WordEntry(
                         w.lookupKey, w.reading,
@@ -607,7 +617,7 @@ class AnalysisPopupController(
                         // is already accounted for in panelContentW).
                         animateExpand(panel, ui.textMaxW)
                     }
-                }.start()
+                }
             }
             // Switching words: collapse the open panel first, then load + expand.
             if (panel.visibility == View.VISIBLE) {
@@ -745,13 +755,13 @@ class AnalysisPopupController(
         if (!ankiPreflight()) return
         btn.isEnabled = false
         btn.alpha = 0.5f
-        Thread {
+        worker.execute {
             val details = JmDict.lookupWordDetail(entry.word)
             val kanji = kanjiInfoForWord(entry.word)
             val back = buildAnkiBackHtml(entry, details, kanji, sentence, translation)
             val result = AnkiDroidHelper.addCard(context, entry.word, back)
             mainHandler.post { applyAnkiResult(result, btn, entry.word) }
-        }.start()
+        }
     }
 
     private fun htmlEscape(s: String): String =
@@ -1246,7 +1256,8 @@ class AnalysisPopupController(
         val showTranslation = prefs.getBoolean(OverlayService.PREF_SHOW_TRANSLATION, true)
 
         val requestId = ++popupRequestSeq
-        Thread {
+        worker.execute {
+            if (requestId != popupRequestSeq) return@execute
             // No-op if the service already warmed it; guards against a tap that
             // races the warm-up.
             JmDict.warmUp(context)
@@ -1290,6 +1301,8 @@ class AnalysisPopupController(
                 runCatching { JapaneseTokenizer.fullRomaji(sentence) }.getOrDefault("")
             else ""
 
+            // A reset during tokenization should not start the expensive ONNX pass.
+            if (requestId != popupRequestSeq) return@execute
             val translation = if (showTranslation)
                 runCatching { Translator.translateJaToEn(sentence) }.getOrDefault("")
             else ""
@@ -1326,7 +1339,7 @@ class AnalysisPopupController(
                 }
                 ui.show()
             }
-        }.start()
+        }
     }
 
     private fun dp(v: Int): Int = (v * context.resources.displayMetrics.density).toInt()

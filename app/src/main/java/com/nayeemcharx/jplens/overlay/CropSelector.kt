@@ -44,9 +44,7 @@ import kotlin.math.min
  * order. Horizontal crops keep ML Kit's order.
  */
 internal fun assembleCropText(result: Text): String {
-    data class BlockPiece(val text: String, val box: Rect?, val vertical: Boolean)
-
-    val pieces = ArrayList<BlockPiece>()
+    val pieces = ArrayList<CropBlockPiece>()
     for (block in result.textBlocks) {
         val vert = isBlockVertical(block)
         val orderedLines = if (vert) {
@@ -58,15 +56,32 @@ internal fun assembleCropText(result: Text): String {
             blockText.append(lineText)
         }
         if (JapaneseTokenizer.containsJapanese(blockText.toString())) {
-            pieces += BlockPiece(blockText.toString(), block.boundingBox, vert)
+            pieces += CropBlockPiece(
+                text = blockText.toString(),
+                centerX = block.boundingBox?.centerX() ?: 0,
+                top = block.boundingBox?.top ?: 0,
+                vertical = vert,
+            )
         }
     }
 
+    return assembleCropPieces(pieces)
+}
+
+/** Pure block-ordering half of [assembleCropText], separated for host tests. */
+internal data class CropBlockPiece(
+    val text: String,
+    val centerX: Int,
+    val top: Int,
+    val vertical: Boolean,
+)
+
+internal fun assembleCropPieces(pieces: List<CropBlockPiece>): String {
     val verticalMajority = pieces.count { it.vertical } * 2 > pieces.size
     val ordered = if (verticalMajority) {
         pieces.sortedWith(
-            compareByDescending<BlockPiece> { it.box?.centerX() ?: 0 }
-                .thenBy { it.box?.top ?: 0 }
+            compareByDescending<CropBlockPiece> { it.centerX }
+                .thenBy { it.top }
         )
     } else pieces
 

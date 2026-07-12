@@ -34,6 +34,7 @@ data class SentenceBox(
     val height: Int,
     val sentenceId: Int,    // shared across all box pieces of the same sentence
     val fullText: String,   // full sentence text (may span multiple line-pieces)
+    val isVertical: Boolean,
 )
 
 /**
@@ -52,7 +53,7 @@ internal fun computeSentenceBoxes(visionText: Text): List<SentenceBox> {
     var sid = 0
 
     for (orderedLines in readingUnits(visionText)) {
-        data class Piece(val rect: android.graphics.Rect, val text: String)
+        data class Piece(val rect: android.graphics.Rect, val text: String, val isVertical: Boolean)
         var pendingPieces = mutableListOf<Piece>()
         val pendingText = StringBuilder()
 
@@ -63,6 +64,10 @@ internal fun computeSentenceBoxes(visionText: Text): List<SentenceBox> {
             // plenty of Latin/digit UI text that just clutters the overlay.
             if (full.isNotEmpty() && JapaneseTokenizer.containsJapanese(full)) {
                 for (p in pendingPieces) {
+                    // Judge each physical box by its own OCR text. A Japanese
+                    // sentence can span a useful Japanese piece plus a noisy
+                    // Latin-heavy piece; only the useful piece should render.
+                    if (!hasEnoughJapaneseForSentenceBox(p.text)) continue
                     out += SentenceBox(
                         left = p.rect.left,
                         top = p.rect.top,
@@ -70,6 +75,7 @@ internal fun computeSentenceBoxes(visionText: Text): List<SentenceBox> {
                         height = max(p.rect.height(), 1),
                         sentenceId = sid,
                         fullText = full,
+                        isVertical = p.isVertical,
                     )
                 }
                 sid++
@@ -91,7 +97,7 @@ internal fun computeSentenceBoxes(visionText: Text): List<SentenceBox> {
                     val segEnd = i + 1
                     val rect = rectForRange(ranges, segStart, segEnd, lineVert, lineBox, lineText.length)
                     if (rect != null) {
-                        pendingPieces += Piece(rect, lineText.substring(segStart, segEnd))
+                        pendingPieces += Piece(rect, lineText.substring(segStart, segEnd), lineVert)
                         pendingText.append(lineText, segStart, segEnd)
                     }
                     flushSentence()
@@ -102,7 +108,7 @@ internal fun computeSentenceBoxes(visionText: Text): List<SentenceBox> {
             if (segStart < lineText.length) {
                 val rect = rectForRange(ranges, segStart, lineText.length, lineVert, lineBox, lineText.length)
                 if (rect != null) {
-                    pendingPieces += Piece(rect, lineText.substring(segStart, lineText.length))
+                    pendingPieces += Piece(rect, lineText.substring(segStart, lineText.length), lineVert)
                     pendingText.append(lineText, segStart, lineText.length)
                 }
             }
@@ -110,7 +116,37 @@ internal fun computeSentenceBoxes(visionText: Text): List<SentenceBox> {
         // End of reading unit — flush any sentence that lacked a terminator.
         flushSentence()
     }
-    return out
+    // ML Kit can report the same physical text twice, once horizontally and once
+    // vertically. In an overlap, tategaki is the authoritative interpretation:
+    // remove the horizontal rectangle entirely instead of merely preferring the
+    // vertical one during hit-testing.
+    return preferVerticalSentenceBoxes(out)
+}
+
+/** Strictly more than 30% of all characters must be Japanese. */
+internal fun hasEnoughJapaneseForSentenceBox(text: String): Boolean {
+    if (text.isEmpty()) return false
+    val japaneseCount = text.count { ch ->
+        JapaneseTokenizer.containsJapanese(ch.toString())
+    }
+    return japaneseCount * 10 > text.length * 3
+}
+
+/**
+ * Removes every horizontal box that has positive-area intersection with a
+ * vertical box. Vertical boxes are never removed, including when several of
+ * them are crossed by the same horizontal OCR result.
+ */
+internal fun preferVerticalSentenceBoxes(boxes: List<SentenceBox>): List<SentenceBox> {
+    val vertical = boxes.filter { it.isVertical }
+    return boxes.filter { candidate ->
+        candidate.isVertical || vertical.none { v ->
+            candidate.left < v.left + v.width &&
+                candidate.left + candidate.width > v.left &&
+                candidate.top < v.top + v.height &&
+                candidate.top + candidate.height > v.top
+        }
+    }
 }
 
 /**
@@ -295,7 +331,10 @@ class SentenceBoxOverlayController(
         }
 
         override fun onDraw(canvas: Canvas) {
-            for (i in rects.indices) {
+            // Draw horizontal boxes first so prioritized vertical boxes are also
+            // visually on top where OCR geometry overlaps.
+            val drawOrder = boxes.indices.sortedBy { if (boxes[it].isVertical) 1 else 0 }
+            for (i in drawOrder) {
                 val r = rects[i]
                 canvas.drawRoundRect(r, corner, corner,
                     if (i == pressedIndex) pressedFillPaint else fillPaint)
@@ -315,7 +354,12 @@ class SentenceBoxOverlayController(
                 MotionEvent.ACTION_DOWN -> {
                     downX = event.x
                     downY = event.y
-                    pressedIndex = rects.indexOfFirst { it.contains(x, y) }
+                    // OCR rectangles can overlap. Tategaki is narrower and easier
+                    // to accidentally mask, so a vertical candidate wins regardless
+                    // of the source/result order.
+                    pressedIndex = boxes.indices.firstOrNull {
+                        boxes[it].isVertical && rects[it].contains(x, y)
+                    } ?: rects.indexOfFirst { it.contains(x, y) }
                     if (pressedIndex < 0) {
                         // Empty area — the tap dismisses the boxes.
                         onDismissRequest()

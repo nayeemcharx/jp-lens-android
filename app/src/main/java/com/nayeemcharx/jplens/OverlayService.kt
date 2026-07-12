@@ -37,7 +37,9 @@ import com.nayeemcharx.jplens.overlay.SentenceBox
 import com.nayeemcharx.jplens.overlay.SentenceBoxOverlayController
 import com.nayeemcharx.jplens.overlay.assembleCropText
 import com.nayeemcharx.jplens.overlay.computeSentenceBoxes
-import kotlin.math.abs
+import com.nayeemcharx.jplens.overlay.CaptureTapAction
+import com.nayeemcharx.jplens.overlay.captureTapAction
+import com.nayeemcharx.jplens.overlay.hasSignificantFrameChange
 
 /**
  * The capture runtime: a foreground service that owns the MediaProjection +
@@ -110,6 +112,9 @@ class OverlayService : Service() {
 
     private val mainHandler by lazy { Handler(mainLooper) }
     @Volatile private var isProcessing = false
+    // Supersede token for capture/OCR callbacks. Resetting while loading bumps it,
+    // so work already queued on ML Kit/captureHandler cannot revive stale UI.
+    @Volatile private var captureRequestSeq = 0
 
     // Frame-change watcher: while overlays are showing, periodically sample the
     // captured screen and drop the (now-stale) overlays when the underlying content
@@ -145,6 +150,7 @@ class OverlayService : Service() {
             this, windowManager, mainHandler,
             object : FloatingButtonController.Listener {
                 override fun onButtonTap() = captureAndRecognize()
+                override fun onLoadingTap() = resetPendingWork()
                 override fun onModeSelected(mode: Int) = setMode(mode)
                 override fun onStopRequested() { stopSelf() }
             })
@@ -160,7 +166,10 @@ class OverlayService : Service() {
                 // INVISIBLE, receives no input).
                 override fun onPopupShown() {
                     sentenceBoxes.setVisible(false)
+                    // Store the active appearance while the spinner still owns the
+                    // pixels, then switch directly spinner -> ✕ in one redraw.
                     updateOcrButtonAppearance()
+                    floatingButton.setLoading(false)
                 }
                 override fun onPopupDismissed() {
                     sentenceBoxes.setVisible(true)
@@ -172,20 +181,32 @@ class OverlayService : Service() {
             object : CropSelectorController.Listener {
                 override fun onCropCommitted(bitmap: Bitmap, crop: Rect) {
                     floatingButton.setButtonVisible(true)
+                    floatingButton.setLoading(true)
+                    val requestId = captureRequestSeq
                     captureHandler?.post {
+                        if (requestId != captureRequestSeq) return@post
                         try {
-                            val cropped = Bitmap.createBitmap(
+                            var cropped = Bitmap.createBitmap(
                                 bitmap, crop.left, crop.top, crop.width(), crop.height())
+                            // A full-screen crop may return the original bitmap.
+                            // Always give OCR an independent bitmap because the
+                            // selector snapshot was recently owned by ImageView's
+                            // render thread and must never be explicitly recycled.
+                            if (cropped === bitmap) {
+                                cropped = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                            }
                             Log.i(TAG, "Crop OCR: (${crop.left},${crop.top}) ${crop.width()}x${crop.height()}")
-                            runCropOcr(cropped, crop)
+                            runCropOcr(cropped, crop, requestId)
                         } catch (ex: Exception) {
                             Log.e(TAG, "Crop OCR failed", ex)
                             isProcessing = false
+                            mainHandler.post { floatingButton.setLoading(false) }
                         }
                     }
                 }
                 override fun onCropCancelled() {
                     isProcessing = false
+                    floatingButton.setLoading(false)
                     floatingButton.setButtonVisible(true)
                 }
             })
@@ -419,39 +440,48 @@ class OverlayService : Service() {
 
     /** True when enough grid cells differ enough — a substantial content change. */
     private fun signatureChanged(a: IntArray, b: IntArray): Boolean {
-        if (a.size != b.size) return true
-        var changedCells = 0
-        for (i in a.indices) if (abs(a[i] - b[i]) > changeThreshold) changedCells++
         // Require ~35% of the screen to change so scrolling a line doesn't nuke boxes,
         // but an app/window switch (near-total change) does.
-        return changedCells > a.size * 35 / 100
+        return hasSignificantFrameChange(a, b, changeThreshold)
     }
 
     // ───────────────────────── Capture + OCR ─────────────────────────
 
     private fun captureAndRecognize() {
-        // Toggle: if any overlay is showing, just clear it. (A crop-mode popup has
-        // no boxes, so check it separately — it must also be gone before the next
-        // snapshot, or it would be captured into it.)
-        if (sentenceBoxes.isShowing) {
-            clearSentenceBoxes()
-            return
+        when (captureTapAction(
+            sentenceBoxesShowing = sentenceBoxes.isShowing,
+            popupShowing = analysisPopup.isShowing,
+            processing = isProcessing,
+            cropSelectorActive = cropSelector.isActive,
+        )) {
+            CaptureTapAction.CLEAR_SENTENCE_BOXES -> { clearSentenceBoxes(); return }
+            CaptureTapAction.DISMISS_POPUP -> { analysisPopup.dismiss(); return }
+            CaptureTapAction.IGNORE_WHILE_BUSY -> return
+            CaptureTapAction.START_CAPTURE -> Unit
         }
-        if (analysisPopup.isShowing) {
-            analysisPopup.dismiss()
-            return
-        }
-        if (isProcessing || cropSelector.isActive) return
         val reader = imageReader ?: return
         // A new capture supersedes any popup lookup still in flight — otherwise a
         // stale popup could surface on top of the new snapshot/selector.
         analysisPopup.invalidatePending()
         isProcessing = true
-        // Hide the button so it isn't captured, then capture next frame.
-        floatingButton.setButtonVisible(false)
+        val requestId = ++captureRequestSeq
+        // Acknowledge the tap immediately, then smoothly fade the overlay layer out
+        // for the clean MediaProjection frame (FLAG_SECURE creates a black patch).
+        floatingButton.setLoading(true)
 
-        captureHandler?.postDelayed({
-            var image: Image? = null
+        mainHandler.postDelayed({
+            if (requestId != captureRequestSeq) return@postDelayed
+            floatingButton.fadeOutForCapture {
+                captureHandler?.postDelayed({
+                    if (requestId == captureRequestSeq) captureFrame(reader, requestId)
+                }, 32L)
+            }
+        }, 140L)
+    }
+
+    private fun captureFrame(reader: ImageReader, requestId: Int) {
+        if (requestId != captureRequestSeq) return
+        var image: Image? = null
             // In crop mode the snapshot is handed to the crop selector, which keeps
             // the button hidden and isProcessing set until the user commits/cancels;
             // otherwise OCR takes over and resets isProcessing from its listeners.
@@ -462,11 +492,19 @@ class OverlayService : Service() {
                     Log.w(TAG, "No image available")
                 } else {
                     val bitmap = imageToBitmap(image)
+                    if (requestId != captureRequestSeq) return
                     if (mode == MODE_CROP) {
                         handedOff = true
-                        mainHandler.post { cropSelector.show(bitmap) }
+                        mainHandler.post {
+                            if (requestId != captureRequestSeq) return@post
+                            // Both operations happen in one main-loop turn, so no
+                            // button-less frame is composited. Hide first so a failed
+                            // selector add can safely restore it via onCropCancelled.
+                            floatingButton.setButtonVisible(false)
+                            cropSelector.show(bitmap)
+                        }
                     } else {
-                        runOcr(bitmap)
+                        runOcr(bitmap, requestId)
                         handedOff = true
                         mainHandler.post { floatingButton.setButtonVisible(true) }
                     }
@@ -477,10 +515,12 @@ class OverlayService : Service() {
                 image?.close()
                 if (!handedOff) {
                     isProcessing = false
-                    mainHandler.post { floatingButton.setButtonVisible(true) }
+                    mainHandler.post {
+                        floatingButton.setButtonVisible(true)
+                        floatingButton.setLoading(false)
+                    }
                 }
             }
-        }, 120)
     }
 
     private fun imageToBitmap(image: Image): Bitmap {
@@ -490,27 +530,31 @@ class OverlayService : Service() {
         val rowStride = plane.rowStride
         val rowPadding = rowStride - pixelStride * image.width
 
-        val bitmap = Bitmap.createBitmap(
+        val padded = Bitmap.createBitmap(
             image.width + rowPadding / pixelStride,
             image.height,
             Bitmap.Config.ARGB_8888
         )
-        bitmap.copyPixelsFromBuffer(buffer)
+        padded.copyPixelsFromBuffer(buffer)
         // Crop off the padding columns.
-        return Bitmap.createBitmap(bitmap, 0, 0, image.width, image.height)
+        val result = Bitmap.createBitmap(padded, 0, 0, image.width, image.height)
+        if (result !== padded) padded.recycle()
+        return result
     }
 
     /** Sentence mode: OCR the full screen and overlay clickable sentence boxes. */
-    private fun runOcr(bitmap: Bitmap) {
+    private fun runOcr(bitmap: Bitmap, requestId: Int) {
         val input = InputImage.fromBitmap(bitmap, 0)
         recognizer.process(input)
             .addOnSuccessListener { result ->
+                if (requestId != captureRequestSeq) return@addOnSuccessListener
                 Log.i(TAG, "── OCR result ──")
                 if (result.text.isBlank()) {
                     Log.i(TAG, "(no text)")
                     Log.i(TAG, "────────────────")
                     Toast.makeText(this, "No Japanese text found", Toast.LENGTH_SHORT).show()
                     isProcessing = false
+                    floatingButton.setLoading(false)
                     return@addOnSuccessListener
                 }
                 for (block in result.textBlocks) {
@@ -521,18 +565,23 @@ class OverlayService : Service() {
                     val sboxes = computeSentenceBoxes(result)
                     Log.i(TAG, "Sentence boxes: ${sboxes.size}")
                     mainHandler.post {
+                        if (requestId != captureRequestSeq) return@post
                         if (sboxes.isEmpty()) {
                             Toast.makeText(this, "No Japanese text found", Toast.LENGTH_SHORT).show()
                         }
                         renderSentenceBoxes(sboxes)
                         isProcessing = false
+                        floatingButton.setLoading(false)
                     }
                 }
             }
             .addOnFailureListener { e ->
+                if (requestId != captureRequestSeq) return@addOnFailureListener
                 Log.e(TAG, "OCR failed", e)
                 isProcessing = false
+                mainHandler.post { floatingButton.setLoading(false) }
             }
+            .addOnCompleteListener { if (!bitmap.isRecycled) bitmap.recycle() }
     }
 
     /**
@@ -540,29 +589,34 @@ class OverlayService : Service() {
      * the analysis popup directly with **all** the Japanese text found in the
      * crop, assembled in reading order ([assembleCropText]).
      */
-    private fun runCropOcr(bitmap: Bitmap, cropRect: Rect) {
+    private fun runCropOcr(bitmap: Bitmap, cropRect: Rect, requestId: Int) {
         val input = InputImage.fromBitmap(bitmap, 0)
         recognizer.process(input)
             .addOnSuccessListener { result ->
+                if (requestId != captureRequestSeq) return@addOnSuccessListener
                 val text = assembleCropText(result)
                 Log.i(TAG, "Crop OCR text → \"$text\"")
                 isProcessing = false
                 if (text.isEmpty()) {
+                    floatingButton.setLoading(false)
                     Toast.makeText(this, "No Japanese text found in the selection", Toast.LENGTH_SHORT).show()
                 } else {
                     analysisPopup.showDictAnalysisPopup(text, cropRect)
                 }
             }
             .addOnFailureListener { e ->
+                if (requestId != captureRequestSeq) return@addOnFailureListener
                 Log.e(TAG, "Crop OCR failed", e)
                 isProcessing = false
+                mainHandler.post { floatingButton.setLoading(false) }
             }
+            .addOnCompleteListener { if (!bitmap.isRecycled) bitmap.recycle() }
     }
 
     // ───────────────────────── Sentence boxes ─────────────────────────
 
     private fun renderSentenceBoxes(boxes: List<SentenceBox>) {
-        clearSentenceBoxes()
+        clearSentenceBoxes(resetLoading = false)
         if (boxes.isEmpty()) return
         if (sentenceBoxes.render(boxes)) {
             // The fullscreen overlay was just added ABOVE the floating button
@@ -574,21 +628,38 @@ class OverlayService : Service() {
             startChangeWatch()
         }
         updateOcrButtonAppearance()
+        // updateOcrButtonAppearance stored active=true while the spinner remained
+        // drawn, so this is a direct spinner -> ✕ transition without an icon flash.
+        floatingButton.setLoading(false)
     }
 
-    private fun clearSentenceBoxes() {
+    private fun clearSentenceBoxes(resetLoading: Boolean = true) {
         stopChangeWatch()
         analysisPopup.dismiss()
         sentenceBoxes.clear()
+        if (resetLoading) floatingButton.setLoading(false)
         updateOcrButtonAppearance()
     }
 
     private fun onSentenceClick(box: SentenceBox) {
         Log.i(TAG, "sentence tap → ${box.fullText}")
+        floatingButton.setLoading(true)
         analysisPopup.showDictAnalysisPopup(
             box.fullText,
             Rect(box.left, box.top, box.left + box.width, box.top + box.height),
         )
+    }
+
+    /** User tapped the spinner: cancel all pending work and return to idle. */
+    private fun resetPendingWork() {
+        captureRequestSeq++
+        isProcessing = false
+        analysisPopup.invalidatePending()
+        cropSelector.cancel()
+        clearSentenceBoxes()
+        floatingButton.setButtonVisible(true)
+        floatingButton.setLoading(false)
+        updateOcrButtonAppearance()
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -606,6 +677,7 @@ class OverlayService : Service() {
         isRunning = false
         cropSelector.cancel()
         clearSentenceBoxes()
+        analysisPopup.destroy()
         floatingButton.destroy()
         virtualDisplay?.release()
         virtualDisplay = null

@@ -1,6 +1,7 @@
 package com.nayeemcharx.jplens.overlay
 
 import android.animation.ValueAnimator
+import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
@@ -8,6 +9,7 @@ import android.graphics.ColorFilter
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
@@ -22,6 +24,7 @@ import android.view.View
 import android.view.WindowManager
 import android.view.animation.AccelerateInterpolator
 import android.view.animation.DecelerateInterpolator
+import android.view.animation.LinearInterpolator
 import android.view.animation.OvershootInterpolator
 import android.widget.Button
 import android.widget.FrameLayout
@@ -141,6 +144,8 @@ class FloatingButtonController(
     interface Listener {
         /** Plain tap: capture (or clear the showing overlay). */
         fun onButtonTap()
+        /** Tap while processing: cancel pending work and restore the idle state. */
+        fun onLoadingTap()
         /** A mode was picked from the hold menu. */
         fun onModeSelected(mode: Int)
         /** "Stop" was picked from the hold menu. */
@@ -157,6 +162,8 @@ class FloatingButtonController(
 
     private var buttonView: FloatingButtonView? = null
     private var buttonParams: WindowManager.LayoutParams? = null
+    private var appearanceActive = false
+    private var appearanceMode = OverlayService.MODE_SENTENCE_DICT
 
     // Gesture state (main thread only). gestureActive = finger currently down on
     // the button; menuSteering = this gesture opened the menu and now drives its
@@ -207,15 +214,64 @@ class FloatingButtonController(
      * on it — the exact race that used to strand the menu), the rest of the
      * touch stream is lost, so treat it as a cancelled gesture and clean up.
      */
+    // This is a raw WindowManager overlay with fully custom text/background/spinner
+    // drawing, not a theme-inflated widget. AppCompatButton would incorrectly add
+    // an AppCompat-theme requirement to the service overlay context.
+    @SuppressLint("AppCompatCustomView")
     private inner class FloatingButtonView(context: Context) : Button(context) {
+        var loading = false
+        private var spinnerAngle = 0f
+        private val spinnerBounds = RectF()
+        private val spinnerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.STROKE
+            strokeWidth = dp(3).toFloat()
+            strokeCap = Paint.Cap.ROUND
+        }
+        private val spinnerAnimator = ValueAnimator.ofFloat(0f, 360f).apply {
+            duration = 760L
+            repeatCount = ValueAnimator.INFINITE
+            interpolator = LinearInterpolator()
+            addUpdateListener {
+                spinnerAngle = it.animatedValue as Float
+                invalidate()
+            }
+        }
+
+        fun setLoadingState(value: Boolean) {
+            if (loading == value) return
+            loading = value
+            if (value) spinnerAnimator.start() else spinnerAnimator.cancel()
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            if (!loading) return
+            val radius = dp(11).toFloat()
+            val cx = width / 2f
+            val cy = height / 2f
+            spinnerBounds.set(cx - radius, cy - radius, cx + radius, cy + radius)
+            canvas.drawArc(spinnerBounds, spinnerAngle, 275f, false, spinnerPaint)
+        }
+
         override fun onDetachedFromWindow() {
             super.onDetachedFromWindow()
+            spinnerAnimator.cancel()
             if (gestureActive || menuWindow != null) abortGesture()
+        }
+
+        override fun onAttachedToWindow() {
+            super.onAttachedToWindow()
+            if (loading && !spinnerAnimator.isStarted) spinnerAnimator.start()
         }
     }
 
     private val longPressRunnable = Runnable {
-        if (!gestureActive || buttonView?.isAttachedToWindow != true) return@Runnable
+        val btn = buttonView
+        if (!gestureActive || btn?.isAttachedToWindow != true ||
+            btn.loading || appearanceActive
+        ) return@Runnable
         menuSteering = true
         buttonView?.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
         showMenu()
@@ -266,7 +322,36 @@ class FloatingButtonController(
 
     /** INVISIBLE while capturing (so the button isn't in the snapshot) / while the crop selector is up. */
     fun setButtonVisible(visible: Boolean) {
-        buttonView?.visibility = if (visible) View.VISIBLE else View.INVISIBLE
+        val btn = buttonView ?: return
+        btn.animate().cancel()
+        if (visible) {
+            btn.visibility = View.VISIBLE
+            if (btn.alpha < 1f) btn.animate().alpha(1f).setDuration(90L).start()
+        } else {
+            btn.visibility = View.INVISIBLE
+            btn.alpha = 1f
+        }
+    }
+
+    /** Smoothly removes the button layer, then signals that a clean frame is safe. */
+    fun fadeOutForCapture(onHidden: () -> Unit) {
+        val btn = buttonView ?: run { onHidden(); return }
+        btn.animate().cancel()
+        btn.animate()
+            .alpha(0f)
+            .setDuration(80L)
+            .withEndAction {
+                if (buttonView === btn && btn.isAttachedToWindow) onHidden()
+            }
+            .start()
+    }
+
+    /** Keeps the button present and replaces its action glyph with a spinner. */
+    fun setLoading(loading: Boolean) {
+        val btn = buttonView ?: return
+        btn.setLoadingState(loading)
+        updateAppearance(appearanceActive, appearanceMode)
+        btn.contentDescription = if (loading) "Processing Japanese text" else "Capture Japanese text"
     }
 
     /**
@@ -339,10 +424,13 @@ class FloatingButtonController(
     /** Restyles the button: ✕ (tap clears) when [active], else the mode's glyph. */
     fun updateAppearance(active: Boolean, mode: Int) {
         val btn = buttonView ?: return
+        appearanceActive = active
+        appearanceMode = mode
         // Full-screen mode uses a drawn bracket icon (no glyph); the other states
         // keep their text glyphs.
-        val fullScreen = !active && mode != OverlayService.MODE_CROP
+        val fullScreen = !btn.loading && !active && mode != OverlayService.MODE_CROP
         btn.text = when {
+            btn.loading -> ""
             active -> "✕"
             mode == OverlayService.MODE_CROP -> "✂"
             else -> ""
@@ -354,6 +442,8 @@ class FloatingButtonController(
         } else null
         btn.textSize = if (active) 18f else 20f
         val base = when {
+            btn.loading && mode == OverlayService.MODE_CROP -> Color.argb(230, 230, 140, 40)
+            btn.loading -> Color.argb(230, 40, 160, 120)
             active -> Color.argb(235, 220, 80, 60)
             mode == OverlayService.MODE_CROP -> Color.argb(230, 230, 140, 40)
             else -> Color.argb(230, 40, 160, 120)
@@ -364,7 +454,7 @@ class FloatingButtonController(
             GradientDrawable.Orientation.TOP_BOTTOM,
             intArrayOf(lighten(base, 0.30f), darken(base, 0.18f))
         ).apply {
-            if (active) {
+            if (active && !btn.loading) {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = dp(14).toFloat()
             } else {
@@ -394,7 +484,11 @@ class FloatingButtonController(
                     initialY = params.y
                     touchStartX = event.rawX
                     touchStartY = event.rawY
-                    mainHandler.postDelayed(longPressRunnable, MENU_HOLD_MS)
+                    // Loading and ✕ are single-purpose states. Keep tap/drag
+                    // handling intact, but never let a hold open the radial menu.
+                    if (!(buttonView?.loading ?: false) && !appearanceActive) {
+                        mainHandler.postDelayed(longPressRunnable, MENU_HOLD_MS)
+                    }
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
@@ -443,7 +537,10 @@ class FloatingButtonController(
                 else -> false
             }
         }
-        view.setOnClickListener { listener.onButtonTap() }
+        view.setOnClickListener {
+            if (buttonView?.loading == true) listener.onLoadingTap()
+            else listener.onButtonTap()
+        }
     }
 
     /**
