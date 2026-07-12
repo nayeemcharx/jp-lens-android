@@ -546,6 +546,14 @@ fun PermissionFlow(
             Hint("• Offline translation has its limitations. Online translation services typically incur ongoing costs, so this free app currently uses offline translation only. Future versions may support optional online translation plugins.")
         }
 
+        var showTutorial by remember { mutableStateOf(false) }
+        TextButton(onClick = { showTutorial = true }, modifier = Modifier.fillMaxWidth()) {
+            Text("How to use JP Lens  ▶")
+        }
+        if (showTutorial) {
+            TutorialDialog(onDismiss = { showTutorial = false })
+        }
+
         TextButton(onClick = onAbout, modifier = Modifier.fillMaxWidth()) {
             Text("About & privacy")
         }
