@@ -55,4 +55,14 @@ class CropTextPolicyTest {
     fun emptyInputProducesEmptyText() {
         assertEquals("", assembleCropPieces(emptyList()))
     }
+
+    @Test
+    fun verticalReorderingDoesNotMutateCallerList() {
+        val left = CropBlockPiece("左", centerX = 10, top = 0, vertical = true)
+        val right = CropBlockPiece("右", centerX = 100, top = 0, vertical = true)
+        val input = mutableListOf(left, right)
+
+        assertEquals("右 左", assembleCropPieces(input))
+        assertEquals(listOf(left, right), input)
+    }
 }

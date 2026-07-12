@@ -23,6 +23,20 @@
                 <map>
                   <entry key="Duration" value="90" />
                   <entry key="Tests" value="360" />
+                  <entry key="Xiaomi 24090RA29I" value="120" />
+                  <entry key="samsung SM-X510" value="120" />
+                </map>
+              </option>
+            </AndroidTestResultsTableState>
+          </value>
+        </entry>
+        <entry key="1407962533">
+          <value>
+            <AndroidTestResultsTableState>
+              <option name="preferredColumnWidths">
+                <map>
+                  <entry key="Duration" value="90" />
+                  <entry key="Tests" value="360" />
                   <entry key="samsung SM-X510" value="120" />
                 </map>
               </option>

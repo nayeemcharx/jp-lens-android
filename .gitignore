@@ -14,14 +14,35 @@
 .cxx
 local.properties
 
-# Generated offline dictionary (built by scripts/build_jmdict_db.py); too large to commit.
-/app/src/main/assets/jmdict.db
+# Generated/large app assets (jmdict.db, fugumt/, tutorial videos, etc.) — built by scripts/, not committed.
+/app/src/main/assets/
 
-# Sudachi system dictionary (fetched by scripts/build_sudachi_dict.py); ~140 MB, not committed.
-/app/src/main/assets/system_full.dic
+# Release build output (AAB, baseline profiles, metadata).
+/app/release/
 
-# FuguMT offline translation bundle (built by scripts/build_fugumt.py); ~80 MB, not committed.
-/app/src/main/assets/fugumt/
+# Debug-only e2e test fixtures — ignore everything except the fixture source + its README
+# (the manifest and the smoke-test PNG are excluded; kept out of git status/tracking).
+/app/src/debug/*
+!/app/src/debug/java/
+/app/src/debug/java/*
+!/app/src/debug/java/com/
+/app/src/debug/java/com/*
+!/app/src/debug/java/com/nayeemcharx/
+/app/src/debug/java/com/nayeemcharx/*
+!/app/src/debug/java/com/nayeemcharx/jplens/
+/app/src/debug/java/com/nayeemcharx/jplens/*
+!/app/src/debug/java/com/nayeemcharx/jplens/e2e/
+/app/src/debug/java/com/nayeemcharx/jplens/e2e/*
+!/app/src/debug/java/com/nayeemcharx/jplens/e2e/E2eFixtureActivity.kt
+!/app/src/debug/assets/
+/app/src/debug/assets/*
+!/app/src/debug/assets/e2e/
+/app/src/debug/assets/e2e/*
+!/app/src/debug/assets/e2e/README.md
+
+# Build/tooling scripts dir — keeps scratch outputs (__pycache__, generated userdict build files)
+# out of git status without affecting already-tracked scripts.
+/scripts/
 
 # Generated Anki decks (built by scripts/build_anki_apkg.py).
 /*.apkg
