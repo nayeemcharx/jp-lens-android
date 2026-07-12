@@ -13,6 +13,7 @@ import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.text.Spannable
@@ -20,6 +21,7 @@ import android.text.SpannableStringBuilder
 import android.text.style.ForegroundColorSpan
 import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
+import android.text.style.UnderlineSpan
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
@@ -906,6 +908,7 @@ class AnalysisPopupController(
         val romajiBody: TextView,
         val transHeader: TextView,
         val transBody: TextView,
+        val transLink: TextView,
         val textMaxW: Int,
         val show: () -> Unit,
     )
@@ -1049,7 +1052,7 @@ class AnalysisPopupController(
             visibility = View.GONE
         }
         val transHeader = TextView(context).apply {
-            text = "Translation"
+            text = "Offline translation"
             setTextColor(Color.argb(255, 180, 220, 255))
             textSize = 12f
             setPadding(0, dp(6), 0, dp(2))
@@ -1060,6 +1063,16 @@ class AnalysisPopupController(
             textSize = 14f
             maxWidth = textMaxW
             visibility = View.GONE
+        }
+        // Right-aligned "Feels wrong? Google Translate" line below the result.
+        val transLink = TextView(context).apply {
+            text = translateLinkLabel()
+            textSize = 12f
+            gravity = Gravity.END
+            setPadding(0, dp(3), 0, 0)
+            isClickable = true
+            visibility = View.GONE
+            contentDescription = "Open sentence in Google Translate"
         }
         val sectionsCol = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
@@ -1074,6 +1087,7 @@ class AnalysisPopupController(
             addView(romajiBody)
             addView(transHeader)
             addView(transBody)
+            addView(transLink)
         }
         // ScrollView that caps its own height so the top bar + sentence + sections
         // never exceed maxPopupH. Below the cap it wraps to content (the popup stays
@@ -1233,6 +1247,7 @@ class AnalysisPopupController(
             romajiBody = romajiBody,
             transHeader = transHeader,
             transBody = transBody,
+            transLink = transLink,
             textMaxW = textMaxW,
             show = { show() },
         )
@@ -1336,9 +1351,54 @@ class AnalysisPopupController(
                     }
                     ui.transHeader.visibility = View.VISIBLE
                     ui.transBody.visibility = View.VISIBLE
+                    // A separate right-aligned line offers Google Translate as an
+                    // alternative (browser hand-off). Kept off the result line so the
+                    // offline translation never reads as if it came from Google.
+                    ui.transLink.setOnClickListener { openInGoogleTranslate(sentence) }
+                    ui.transLink.visibility = View.VISIBLE
                 }
                 ui.show()
             }
+        }
+    }
+
+    // ───────────────────── Google Translate hand-off ───────────────────────
+
+    /**
+     * The Translation section's secondary action line: a muted "Feels wrong?"
+     * prompt followed by a small, blue, underlined "Google Translate ↗" link.
+     * It sits on its own right-aligned line BELOW the offline result (not tacked
+     * onto it), so the offline translation never reads as if it came from Google.
+     * The tap handler is wired by the caller ([openInGoogleTranslate] with the
+     * sentence); this only builds the styled label. The action phrase uses
+     * non-breaking spaces so "Google Translate ↗" never splits across two lines.
+     */
+    private fun translateLinkLabel(): CharSequence {
+        val sb = SpannableStringBuilder()
+        val prompt = "Feels wrong?  "
+        sb.append(prompt)
+        sb.setSpan(ForegroundColorSpan(cDim), 0, prompt.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        val a = sb.length
+        // Non-breaking spaces (U+00A0) keep the action phrase on one line.
+        sb.append("Google Translate ↗")
+        sb.setSpan(ForegroundColorSpan(Color.rgb(130, 180, 255)), a, sb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        sb.setSpan(UnderlineSpan(), a, sb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        return sb
+    }
+
+    /**
+     * Opens the user's default browser at Google Translate's public web UI with
+     * [sentence] pre-filled, source Japanese → target English. This is a plain
+     * ACTION_VIEW hand-off (like a "Share to…" tap): the browser makes the request,
+     * not JP Lens, so the app needs no INTERNET permission and stays offline.
+     */
+    private fun openInGoogleTranslate(sentence: String) {
+        val url = "https://translate.google.com/?sl=ja&tl=en&op=translate&text=" +
+            Uri.encode(sentence)
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            .apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK }
+        runCatching { context.startActivity(intent) }.onFailure {
+            Toast.makeText(context, "No browser to open Google Translate", Toast.LENGTH_SHORT).show()
         }
     }
 

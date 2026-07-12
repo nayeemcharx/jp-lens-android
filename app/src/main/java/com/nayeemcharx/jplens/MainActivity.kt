@@ -60,9 +60,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.nayeemcharx.jplens.ui.theme.JplensandroidTheme
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
@@ -330,13 +328,6 @@ fun PermissionFlow(
     val ankiInstalled = remember(resumeTick) { AnkiDroidHelper.isAnkiInstalled(context) }
     val ankiPermission = remember(resumeTick) { AnkiDroidHelper.hasPermission(context) }
 
-    // Offline translation model (FuguMT, bundled in the APK): checking | present | missing.
-    var modelState by remember { mutableStateOf("checking") }
-    LaunchedEffect(Unit) {
-        val ok = withContext(Dispatchers.IO) { Translator.assetPresent(context) }
-        modelState = if (ok) "present" else "missing"
-    }
-
     // Live service state. Polled (cheap volatile read, same process) so the
     // banner tracks reality: the service acquiring the projection, failing to
     // start, or being stopped later from the floating button's hold menu.
@@ -494,7 +485,7 @@ fun PermissionFlow(
             if (!overlayOk) {
                 OutlinedButton(onClick = { openOverlaySettings() }) { Text("Grant overlay permission") }
             }
-            StatusLine(notifOk, if (notifOk) "Notifications — granted" else "Notifications — recommended")
+            StatusLine(notifOk, if (notifOk) "Notifications — granted" else "Notifications — required")
             if (!notifOk) {
                 OutlinedButton(onClick = {
                     notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -514,29 +505,14 @@ fun PermissionFlow(
                 showRomaji = it
                 prefs.edit().putBoolean(OverlayService.PREF_SHOW_ROMAJI, it).apply()
             }
-            ToggleLine("Translation", showTranslation) {
+            ToggleLine("Offline translation", showTranslation) {
                 showTranslation = it
                 prefs.edit().putBoolean(OverlayService.PREF_SHOW_TRANSLATION, it).apply()
             }
         }
 
-        // ── Offline translation model ────────────────────────────────
-        SectionCard("Offline translation", badge = "3") {
-            when (modelState) {
-                "present" -> {
-                    StatusLine(true, "FuguMT translation model bundled — works fully offline, on-device.")
-                    Hint("Used for the breakdown's Translation section.")
-                }
-                "missing" -> {
-                    StatusLine(false, "Translation model not built into this APK.")
-                    Hint("Run scripts/build_fugumt.py to generate app/src/main/assets/fugumt/, then rebuild. Until then, full-sentence translations are unavailable.")
-                }
-                else -> Hint("Checking translation model…")
-            }
-        }
-
         // ── AnkiDroid ────────────────────────────────────────────────
-        SectionCard("Add to AnkiDroid (optional)", badge = "4") {
+        SectionCard("Add to AnkiDroid (optional)", badge = "3") {
             EditableField(
                 label = "Deck name",
                 value = deckName,
@@ -666,7 +642,11 @@ private fun AboutScreen(modifier: Modifier = Modifier, onBack: () -> Unit) {
             )
             Text("Nothing is sent off your device", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Text(
-                "• JP Lens makes no network requests. No screen text, image, or lookup ever leaves your device.\n" +
+                "• JP Lens makes no network requests of its own. No screen text, image, or lookup ever leaves your device.\n" +
+                    "• Google Translate (optional): if you tap the “Google Translate” link under a translation, JP Lens " +
+                    "opens that sentence in your web browser at translate.google.com. The text is then sent to Google by " +
+                    "your browser — like any web search — but only when you tap it. This is the only feature that can send " +
+                    "content off your device.\n" +
                     "• AnkiDroid (optional): if you tap “+”, the chosen word/card is written to the AnkiDroid app " +
                     "already on your device via its local API — nothing is sent to any server.",
                 style = MaterialTheme.typography.bodyMedium,

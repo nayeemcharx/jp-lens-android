@@ -1,6 +1,6 @@
 # Privacy Policy — JP Lens
 
-**Last updated: 8 July 2026**
+**Last updated: 12 July 2026**
 
 JP Lens ("the app") is a free, open-source Android tool that recognises Japanese
 text on your screen and shows dictionary entries, readings, and translations on
@@ -8,8 +8,11 @@ top of it. This policy explains what the app does and does not do with your data
 
 **Short version:** JP Lens does not collect, store, or share any personal data. It
 has no accounts, no ads, and no analytics. **Everything runs on your device** — the
-app has no servers and makes no network requests, so none of your content ever
-leaves your device.
+app has no servers and makes no network requests of its own, so none of your content
+leaves your device. The one exception is the optional **"Google Translate"** link
+shown under a translation: if you tap it, JP Lens opens that sentence in your web
+browser at translate.google.com — so the text is sent to Google by your browser, but
+only when you tap it.
 
 ---
 
@@ -31,9 +34,17 @@ leaves your device.
 
 ## Nothing is sent off your device
 
-JP Lens makes **no network requests**. No screen image, recognised text, dictionary
-lookup, or translation ever leaves your device.
+JP Lens makes **no network requests of its own**. No screen image, recognised text,
+dictionary lookup, or translation is transmitted by the app.
 
+- **Google Translate (optional).** Under each translation, JP Lens shows a
+  "Google Translate" link. If you tap it, the app opens that sentence in your web
+  browser at translate.google.com (source Japanese → English). Your browser — not
+  JP Lens — then requests that page, so the sentence is sent to Google. This happens
+  **only when you tap the link**, and it is the only feature that can send any of
+  your content off your device. JP Lens still requests no Internet permission and
+  makes no network connection itself; it simply hands the text to your browser, the
+  same way tapping any web link does.
 - **AnkiDroid (optional).** If you tap the "+" button on a word, that word/card is
   written to the AnkiDroid app already installed on your device, using AnkiDroid's
   local on-device API. JP Lens does not send this data to any server.
