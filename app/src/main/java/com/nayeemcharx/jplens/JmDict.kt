@@ -49,7 +49,11 @@ object JmDict {
     //    words plain IPADIC can actually emit as a token (the rest could never be looked
     //    up), so no visible gloss is lost, unlike the frequency-based lite build. Built
     //    with `python3 scripts/prune_jmdict_unreachable.py`. Forces older installs to re-copy.
-    private const val DB_ASSET_VERSION = 8
+    // v9: v8 + the 111 JLPT-labelled words the reachability prune had dropped (compounds
+    //    IPADIC splits, e.g. 会議室/お兄さん/高等学校) re-added from the full db, so the JLPT
+    //    set is complete again (7636 -> 7747 JLPT words). ~60 KB larger. See the
+    //    "re-add pruned JLPT words" note in scripts/prune_jmdict_unreachable.py.
+    private const val DB_ASSET_VERSION = 9
     private const val PREF_COPIED_VERSION = "jmdict_db_copied_version"
 
     @Volatile private var db: SQLiteDatabase? = null

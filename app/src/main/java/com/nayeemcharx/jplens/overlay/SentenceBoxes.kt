@@ -60,9 +60,10 @@ internal fun computeSentenceBoxes(visionText: Text): List<SentenceBox> {
         fun flushSentence() {
             if (pendingPieces.isEmpty()) return
             val full = pendingText.toString().trim()
-            // Only render sentences that actually contain Japanese — OCR picks up
-            // plenty of Latin/digit UI text that just clutters the overlay.
-            if (full.isNotEmpty() && JapaneseTokenizer.containsJapanese(full)) {
+            // Gate the assembled sentence as well as each physical piece below.
+            // Checking only pieces can render a Japanese-heavy line fragment whose
+            // associated full sentence is mostly OCR'd Latin/digit UI text.
+            if (hasEnoughJapaneseForSentenceBox(full)) {
                 for (p in pendingPieces) {
                     // Judge each physical box by its own OCR text. A Japanese
                     // sentence can span a useful Japanese piece plus a noisy

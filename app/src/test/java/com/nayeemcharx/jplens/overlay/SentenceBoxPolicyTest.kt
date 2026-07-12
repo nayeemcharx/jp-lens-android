@@ -103,4 +103,13 @@ class SentenceBoxPolicyTest {
         // Only one of these four characters is Japanese: 25%.
         assertEquals(false, hasEnoughJapaneseForSentenceBox("猫 1!"))
     }
+
+    @Test
+    fun assembledSentenceRatioIsCheckedIndependentlyOfItsJapanesePiece() {
+        val japanesePiece = "猫犬鳥"
+        val assembledSentence = japanesePiece + "abcdefghijkl"
+
+        assertEquals(true, hasEnoughJapaneseForSentenceBox(japanesePiece))
+        assertEquals(false, hasEnoughJapaneseForSentenceBox(assembledSentence))
+    }
 }

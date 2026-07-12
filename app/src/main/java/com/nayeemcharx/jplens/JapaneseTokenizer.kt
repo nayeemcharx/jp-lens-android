@@ -1,6 +1,7 @@
 package com.nayeemcharx.jplens
 
 import android.content.Context
+import android.util.Log
 import com.atilika.kuromoji.ipadic.Token
 import com.atilika.kuromoji.ipadic.Tokenizer
 
@@ -11,14 +12,18 @@ import com.atilika.kuromoji.ipadic.Tokenizer
  * and no `java.nio.file` (so `minSdk` can stay at 24) — that's the reason we use it over
  * Sudachi.
  *
+ * A small **user dictionary** ([USER_DICT_ASSET]) is layered on top so ~291 JLPT compound
+ * words that plain IPADIC splits (会議室→会議+室, 誕生日→誕生+日) come out as one token — see
+ * that constant for the how/why and `scripts/kuromoji_userdict/README.md` for how the set was
+ * curated and over-merge-checked.
+ *
  * Filter is a "contains a Japanese character" gate plus a small symbol/other POS blacklist,
  * which drops punctuation, whitespace and stray Latin/digits — keeping nouns, verbs,
  * adjectives, adverbs, particles, etc. with their dictionary form.
  *
  * The public surface ([warmUp], [isAvailable], [extract], [fullReadingHiragana],
  * [katakanaToHiragana], [containsKanji], [Morpheme]) matches what the rest of the app
- * calls. [warmUp] takes a [Context] only for call-site symmetry with [JmDict.warmUp];
- * Kuromoji ignores it.
+ * calls. [warmUp] takes a [Context] so the user dictionary asset can be read.
  */
 object JapaneseTokenizer {
 
@@ -31,25 +36,66 @@ object JapaneseTokenizer {
         val end: Int            // exclusive char offset
     )
 
-    private val tokenizer: Tokenizer by lazy { Tokenizer() }
+    private const val TAG = "JpLens.Tokenizer"
+
+    // A Kuromoji user dictionary (shipped as an asset) that forces ~291 JLPT compound
+    // words to tokenize *whole* — plain IPADIC splits them (会議室→会議+室, 誕生日→誕生+日,
+    // お兄さん→お+兄さん), which meant the JLPT unit could never be looked up or tapped as one
+    // word. Each line is a single-segment entry `surface,surface,katakana-reading,名詞`.
+    // The set is curated (see scripts/kuromoji_userdict/README.md): only JLPT words that
+    // actually split AND that were verified against a 248k-sentence corpus to NOT over-merge
+    // any real word (forcing e.g. 一日 whole would wrongly break 十一日→十|一日, so those are
+    // deliberately excluded). Loaded once at [warmUp]; a load failure falls back to plain
+    // Kuromoji so tokenization still works.
+    private const val USER_DICT_ASSET = "kuromoji_userdict.csv"
 
     private val dropPos = setOf("その他")
+
+    @Volatile private var appContext: Context? = null
+    @Volatile private var cached: Tokenizer? = null
 
     /** Kuromoji's dictionary is bundled in the JAR, so it's always available. */
     fun isAvailable(): Boolean = true
 
     /**
-     * Force the dictionary to load off the hot path. The [context] is unused (kept so the
-     * call site matches [JmDict.warmUp]); call this off the main thread on first use.
+     * Force the dictionary (JAR-bundled) + the JLPT user dictionary (asset) to load off the
+     * hot path, capturing an app [Context] so the user dictionary can be read. Call this off
+     * the main thread on first use (the app does, in `OverlayService`, well before any tap).
      */
-    @Suppress("UNUSED_PARAMETER")
     fun warmUp(context: Context) {
-        tokenizer.tokenize("起動")
+        appContext = context.applicationContext
+        tokenizer().tokenize("起動")
+    }
+
+    /**
+     * The shared tokenizer, built lazily with the JLPT user dictionary once an app context is
+     * available. If [extract] is somehow called before [warmUp] (no context yet), a plain
+     * tokenizer is returned but *not* cached, so the user-dictionary-backed one still gets
+     * built on the next call once the context is set.
+     */
+    private fun tokenizer(): Tokenizer {
+        cached?.let { return it }
+        return synchronized(this) {
+            cached ?: buildTokenizer().also { if (appContext != null) cached = it }
+        }
+    }
+
+    private fun buildTokenizer(): Tokenizer {
+        appContext?.let { ctx ->
+            try {
+                ctx.assets.open(USER_DICT_ASSET).use { input ->
+                    return Tokenizer.Builder().userDictionary(input).build()
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "Kuromoji user dictionary load failed; using plain tokenizer", t)
+            }
+        }
+        return Tokenizer.Builder().build()
     }
 
     fun extract(text: String): List<Morpheme> {
         if (text.isBlank()) return emptyList()
-        return tokenizer.tokenize(text)
+        return tokenizer().tokenize(text)
             .filter { keep(it) }
             .map { it.toMorpheme() }
     }
@@ -94,7 +140,7 @@ object JapaneseTokenizer {
     fun fullReadingHiragana(text: String): String {
         if (text.isBlank()) return ""
         val sb = StringBuilder()
-        for (t in tokenizer.tokenize(text)) {
+        for (t in tokenizer().tokenize(text)) {
             val r = t.reading
             if (r.isNullOrEmpty() || r == "*") sb.append(t.surface)
             else sb.append(katakanaToHiragana(r))
@@ -113,7 +159,7 @@ object JapaneseTokenizer {
     fun fullRomaji(text: String): String {
         if (text.isBlank()) return ""
         val parts = ArrayList<String>()
-        for (t in tokenizer.tokenize(text)) {
+        for (t in tokenizer().tokenize(text)) {
             val kana = when {
                 !t.pronunciation.isNullOrEmpty() && t.pronunciation != "*" -> t.pronunciation
                 !t.reading.isNullOrEmpty() && t.reading != "*" -> t.reading
